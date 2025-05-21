@@ -1,0 +1,16 @@
+fmc_common_f47.o: ../common/fmc_common_f47.c \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/lib/gcc/arm-none-eabi/14.2.1/include/stdint.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/stdint.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/machine/_default_types.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/sys/features.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/_newlib_version.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/sys/_intsup.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/arm-none-eabi/include/sys/_stdint.h \
+ ../../../include/libopencm3/stm32/fsmc.h \
+ ../../../include/libopencm3/cm3/common.h \
+ /Users/sugiharayuta/Developer/toolchains/arm-gnu-toolchain-14.2.rel1-darwin-arm64-arm-none-eabi/lib/gcc/arm-none-eabi/14.2.1/include/stdbool.h \
+ ../../../include/libopencm3/stm32/memorymap.h \
+ ../../../include/libopencm3/stm32/h7/memorymap.h \
+ ../../../include/libopencm3/cm3/memorymap.h \
+ ../../../include/libopencm3/stm32/h7/fmc.h \
+ ../../../include/libopencm3/stm32/common/fmc_common_f47.h
