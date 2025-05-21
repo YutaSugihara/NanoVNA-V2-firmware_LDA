@@ -1,141 +1,405 @@
+// this file must only be included by toplevel module
+
+#include <libopencm3/stm32/adc.h>
+#include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/rtc.h>
+#include <libopencm3/stm32/flash.h>
+#include <mculib/fastwiring.hpp>
+#include <mculib/softi2c.hpp>
+#include <mculib/softspi.hpp>
+#include <mculib/si5351.hpp>
+#include <mculib/adf4350.hpp>
+#include <mculib/dma_adc.hpp>
+
+#include <array>
+#include <stdint.h>
+#include <libopencm3/stm32/f1/dma.h>
+#include <libopencm3/stm32/adc.h>
+
 #include "board.hpp"
-#include <libopencm3/cm3/systick.h>
-#include <libopencm3/gd32/f3/rcu.h>  // GD32用 RCU (Reset and Clock Unit)
-#include <libopencm3/gd32/f3/gpio.h>
-#include <libopencm3/gd32/f3/i2c.h>  // I2C用
-#include <libopencm3/gd32/f3/spi.h>  // SPI用
-#include "spi_slave.hpp" // SPIスレーブ処理をインクルード
+#include "../rfsw.hpp"
 
-// --- グローバル変数 ---
-volatile uint32_t system_millis = 0; // ミリ秒カウンタ
+using namespace mculib;
+using namespace std;
 
-// --- クロック設定 ---
-static void rcu_config(void) {
-    // GD32F303CC (board_v2_plus4) は最大120MHzで動作
-    // 外部クリスタル (HSE_VALUE = 8MHz) を使用
-    rcu_predv0_config(RCU_PREDV0_DIV1); // PRE DV0はPLLの入力前
-    rcu_pll_config(RCU_PLLSRC_HXTAL, RCU_PLL_MUL15); // 8MHz * 15 = 120MHz (GD32F303の場合、最大値と乗数を確認)
-                                                    // GD32F30xでは PLL倍率は最大 x30 (RCU_PLL_MUL30) など、モデルにより異なる
-                                                    // ここでは例として RCU_PLL_MUL15 を使用。実際のボードに合わせてください。
-                                                    // NanoVNA V2 Plus4のファームウェアでは、実際にはより複雑なクロック設定がされている可能性があります。
-                                                    // (例: rcu_system_clock_source_config(RCU_SCS_PLL); rcu_ahb_clock_config(RCU_AHB_CKSYS_DIV1); etc.)
-                                                    // ここでは簡略化のためPLL設定のみ示します。既存のプロジェクトのクロック設定を参照してください。
-    rcu_osci_on(RCU_PLL_CK);
-    rcu_osci_stab_wait(RCU_PLL_CK);
-    rcu_system_clock_source_config(RCU_CKSYSSRC_PLL);
 
-    // AHB, APB1, APB2 のプリスケーラ設定 (F_CPU に応じて)
-    rcu_ahb_clock_config(RCU_AHB_CKSYS_DIV1);      // AHB = SYSCLK
-    rcu_apb1_clock_config(RCU_APB1_CKAHB_DIV2);   // APB1 = SYSCLK / 2 (最大60MHz)
-    rcu_apb2_clock_config(RCU_APB2_CKAHB_DIV1);   // APB2 = SYSCLK
+namespace board {
 
-    // ペリフェラルクロック有効化
-    rcu_periph_clock_enable(RCU_GPIOA);
-    rcu_periph_clock_enable(RCU_GPIOB);
-    rcu_periph_clock_enable(RCU_GPIOC);
-    rcu_periph_clock_enable(RCU_AF); // Alternate Function IO clock enable
+	// set by board_init()
+	uint32_t hseEstimateHz = 0;
+	uint32_t adc_ratecfg = 0;
+	uint32_t adc_srate = 0; // Hz
+	uint32_t adc_period_cycles, adc_clk;
 
-#if BOARD_REVISION >= 2
-    rcu_periph_clock_enable(RCU_I2C0); // Si5351用 I2C0
+	DMADriver dma(DMA1);
+	DMAChannel dmaChannelADC(dma, 1);
+	DMAChannel dmaChannelSPI(dma, 3);
+	DMAADC dmaADC(dmaChannelADC, ADC1);
+
+
+	i2cDelay_t i2cDelay;
+	spiDelay_t spiDelay;
+
+	// TODO(gabu-chan): get rid of template argument after switch to c++17
+	SoftI2C<i2cDelay_t> si5351_i2c(i2cDelay);
+	Si5351::Si5351Driver si5351;
+
+	SoftSPI<spiDelay_t> adf4350_tx_spi(spiDelay);
+	SoftSPI<spiDelay_t> adf4350_rx_spi(spiDelay);
+
+	ADF4350::ADF4350Driver<adf4350_sendWord_t> adf4350_tx(adf4350_sendWord_t {adf4350_tx_spi});
+	ADF4350::ADF4350Driver<adf4350_sendWord_t> adf4350_rx(adf4350_sendWord_t {adf4350_rx_spi});
+
+	XPT2046 xpt2046(xpt2046_irq);
+
+	// same as rcc_set_usbpre, but with extended divider range:
+	// 0: divide by 1.5
+	// 1: divide by 1
+	// 2: divide by 2.5
+	// 3: divide by 2
+	void rcc_set_usbpre_gd32(uint32_t usbpre) {
+		uint32_t RCC_CFGR_USBPRE_MASK = uint32_t(0b11) << 22;
+		uint32_t old = (RCC_CFGR & ~RCC_CFGR_USBPRE_MASK);
+		RCC_CFGR = old | ((usbpre & 0b11) << 22);
+	}
+
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV2 = 0b0000;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV4 = 0b0001;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV6 = 0b0010;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV8 = 0b0011;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV12 = 0b0101;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_PCLK2_DIV16 = 0b0111;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_HCLK_DIV5 = 0b1000;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_HCLK_DIV6 = 0b1001;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_HCLK_DIV10 = 0b1010;
+	constexpr uint32_t GD32_RCC_CFGR_ADCPRE_HCLK_DIV20 = 0b1011;
+
+	static void rcc_set_adcpre_gd32(uint32_t adcpre) {
+		uint32_t RCC_CFGR_ADCPRE_MASK = (0b11 << 14) | (1 << 28);
+		uint32_t RCC_CFGR2_ADCPRE_MASK = 1 << 29;
+		uint32_t old = (RCC_CFGR & ~RCC_CFGR_ADCPRE_MASK);
+		uint32_t old2 = (RCC_CFGR2 & ~RCC_CFGR2_ADCPRE_MASK);
+		RCC_CFGR = old | ((adcpre & 0b11) << 14) | ((adcpre & 0b100) << (28 - 2));
+		RCC_CFGR2 = old2 | ((adcpre & 0b1000) << (29 - 3));
+	}
+
+	/* TODO this code is a copy of code in libopencm3. 
+	 * Should this move to libopencm3? */
+	void rcc_clock_setup_in_hse_24mhz_out_96mhz(void) {
+		 /* Enable internal high-speed oscillator. */
+		 rcc_osc_on(RCC_HSI);
+		 rcc_wait_for_osc_ready(RCC_HSI);
+
+		 /* Select HSI as SYSCLK source. */
+		 rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_HSICLK);
+
+		 /* Enable external high-speed oscillator. */
+		 rcc_osc_on(RCC_HSE);
+		 rcc_wait_for_osc_ready(RCC_HSE);
+		 rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_HSECLK);
+
+		 /*
+		  * Set prescalers for AHB, ADC, ABP1, ABP2.
+		  * Do this before touching the PLL (TODO: why?).
+		  */
+		 rcc_set_hpre(RCC_CFGR_HPRE_SYSCLK_NODIV);					// Set. 96MHz Max. 96MHz
+		 rcc_set_adcpre_gd32(GD32_RCC_CFGR_ADCPRE_PCLK2_DIV16);		// Set. 6MHz Max. 40MHz
+		 rcc_set_ppre1(RCC_CFGR_PPRE1_HCLK_DIV2);					// Set. 48MHz Max. 60MHz
+		 rcc_set_ppre2(RCC_CFGR_PPRE2_HCLK_NODIV);					// Set. 96MHz Max. 120MHz
+		 rcc_set_usbpre_gd32(3);									// 96MHz / 2 = 48MHz
+
+		 /*
+		  * Sysclk runs with 96MHz -> 0 waitstates.
+		  */
+		 flash_set_ws(FLASH_ACR_LATENCY_0WS);
+
+		 /*
+		  * Set the PLL multiplication factor. (x4) 24 * 4 = 96Mhz
+		  */
+		 rcc_set_pll_multiplication_factor(RCC_CFGR_PLLMUL_PLL_CLK_MUL4);
+
+		 /* Select HSE as PLL source. */
+		 rcc_set_pll_source(RCC_CFGR_PLLSRC_HSE_CLK);
+
+		 /*
+		  * External frequency undivided before entering PLL
+		  * (only valid/needed for HSE).
+		  */
+		 rcc_set_pllxtpre(RCC_CFGR_PLLXTPRE_HSE_CLK);
+
+		 /* Enable PLL oscillator and wait for it to stabilize. */
+		 rcc_osc_on(RCC_PLL);
+		 rcc_wait_for_osc_ready(RCC_PLL);
+
+		 /* Select PLL as SYSCLK source. */
+		 rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_PLLCLK);
+
+		 /* Set the peripheral clock frequencies used */
+		 rcc_ahb_frequency = 96000000;
+		 rcc_apb1_frequency = 48000000;
+		 rcc_apb2_frequency = 96000000;
+
+		 cpu_mhz = 96;
+	}
+
+	void rcc_clock_setup_in_hse_24mhz_out_120mhz(void) {
+		 cpu_mhz = 120;
+		 // only run the initialization once
+		 if(RCC_CR & RCC_CR_HSEON) return;
+
+		 /* Enable internal high-speed oscillator. */
+		 rcc_osc_on(RCC_HSI);
+		 rcc_wait_for_osc_ready(RCC_HSI);
+		 
+		 /* Enable external high-speed oscillator. */
+		 rcc_osc_on(RCC_HSE);
+		 rcc_wait_for_osc_ready(RCC_HSE);
+
+		 /* Select HSE as SYSCLK source. */
+		 rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_HSECLK);
+		 
+		 rcc_osc_off(RCC_PLL);
+
+		 /*
+		  * Set prescalers for AHB, ADC, ABP1, ABP2.
+		  * Do this before touching the PLL (TODO: why?).
+		  */
+		 rcc_set_hpre(RCC_CFGR_HPRE_SYSCLK_NODIV);					// Set. 120MHz Max. 120MHz
+		 rcc_set_adcpre_gd32(GD32_RCC_CFGR_ADCPRE_PCLK2_DIV4);		// Set. 30MHz Max. 40MHz
+		 rcc_set_ppre1(RCC_CFGR_PPRE1_HCLK_DIV2);					// Set. 60MHz Max. 60MHz
+		 rcc_set_ppre2(RCC_CFGR_PPRE2_HCLK_NODIV);					// Set. 120MHz Max. 120MHz
+		 rcc_set_usbpre_gd32(2);									// 120MHz / 2.5 = 48MHz
+
+		 /*
+		  * Sysclk runs with 120MHz -> 0 waitstates.
+		  */
+		 flash_set_ws(FLASH_ACR_LATENCY_0WS);
+
+		 /*
+		  * Set the PLL multiplication factor. (x5) 24 * 5 = 120Mhz
+		  */
+		 rcc_set_pll_multiplication_factor(RCC_CFGR_PLLMUL_PLL_CLK_MUL5);
+
+		 /* Select HSE as PLL source. */
+		 rcc_set_pll_source(RCC_CFGR_PLLSRC_HSE_CLK);
+
+		 /*
+		  * External frequency undivided before entering PLL
+		  * (only valid/needed for HSE).
+		  */
+		 rcc_set_pllxtpre(RCC_CFGR_PLLXTPRE_HSE_CLK);
+
+		 /* Enable PLL oscillator and wait for it to stabilize. */
+		 rcc_osc_on(RCC_PLL);
+		 rcc_wait_for_osc_ready(RCC_PLL);
+
+		 /* Select PLL as SYSCLK source. */
+		 rcc_set_sysclk_source(RCC_CFGR_SW_SYSCLKSEL_PLLCLK);
+
+		 /* Set the peripheral clock frequencies used */
+		 rcc_ahb_frequency = 120000000;
+		 rcc_apb1_frequency = 60000000;
+		 rcc_apb2_frequency = 120000000;
+
+	}
+
+	void boardInit() {
+		rcc_clock_setup_in_hse_24mhz_out_120mhz();
+
+		// enable basic peripherals
+		rcc_periph_clock_enable(RCC_GPIOA);
+		rcc_periph_clock_enable(RCC_GPIOB);
+		rcc_periph_clock_enable(RCC_GPIOC);
+
+		rcc_periph_clock_enable(RCC_AFIO);
+		// jtag pins should be used as GPIOs (SWD is used for debugging)
+		gpio_primary_remap(AFIO_MAPR_SWJ_CFG_JTAG_OFF_SW_ON, AFIO_MAPR_SPI1_REMAP);
+		
+
+		digitalWrite(ili9341_cs, HIGH);
+		digitalWrite(xpt2046_cs, HIGH);
+		pinMode(ili9341_dc, OUTPUT);
+		pinMode(ili9341_cs, OUTPUT);
+		pinMode(xpt2046_cs, OUTPUT);
+
+		adc_ratecfg = ADC_SMPR_SMP_7DOT5CYC;
+		adc_srate = 30000000/(7.5+12.5);
+		adc_period_cycles = (7.5+12.5);
+		adc_clk = 30000000;
+	}
+
+
+	// returns an estimate of the HSE frequency in Hz.
+	// called by boardInit() to set hseEstimateHz.
+	uint32_t detectHSEFreq() {
+		rcc_osc_on(RCC_HSE);
+		rcc_osc_on(RCC_HSI);
+		rtc_auto_awake(RCC_HSE, 1 << 19);
+		rtc_exit_config_mode();
+		delay(2);
+		uint32_t tmp = rtc_get_prescale_div_val();
+		delay(20);
+		uint32_t tmp2 = rtc_get_prescale_div_val();
+		// cycles of a fHSE/128 clock elapsed
+		uint32_t cycles = (tmp - tmp2) & ((1 << 20) - 1);
+		uint32_t freqHz = cycles * 128 * 50;
+		return freqHz;
+	}
+
+	void ledPulse() {
+		digitalWrite(led2, HIGH);
+		delayMicroseconds(1);
+		digitalWrite(led2, LOW);
+	}
+	
+	
+	int calculateSynthWaitAF(freqHz_t freqHz) {
+		if(freqHz < 1200000000) return  8;
+		if(freqHz < 2200000000) return 10;
+		if(freqHz < 3200000000) return 14;
+		return 18;
+	}
+
+	int calculateSynthWaitSI(int retval) {
+		switch(retval) {
+			case 0: return 36;
+			case 1: return 120;
+			case 2: return 120;
+		}
+		return 5;
+	}
+
+	void lcd_spi_init() {
+		dmaChannelSPI.enable();
+		gpio_set_mode(lcd_clk.bank(), GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, lcd_clk.mask());
+		gpio_set_mode(lcd_mosi.bank(), GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, lcd_mosi.mask());
+		gpio_set_mode(lcd_miso.bank(), GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, lcd_miso.mask());
+
+		rcc_periph_clock_enable(RCC_SPI1);
+		/* Reset SPI, SPI_CR1 register cleared, SPI is disabled */
+		spi_reset(SPI1);
+
+		/* Set up SPI in Master mode with:
+		* Clock baud rate: 1/64 of peripheral clock frequency
+		* Clock polarity: Idle High
+		* Clock phase: Data valid on 1st clock pulse
+		* Data frame format: 16-bit
+		* Frame format: MSB First
+		*/
+		spi_init_master(SPI1, SPI_CR1_BAUDRATE_FPCLK_DIV_64, SPI_CR1_CPOL_CLK_TO_1_WHEN_IDLE,
+						SPI_CR1_CPHA_CLK_TRANSITION_2, SPI_CR1_DFF_8BIT, SPI_CR1_MSBFIRST);
+
+		/*
+		* Set NSS management to software.
+		*
+		* Note:
+		* Setting nss high is very important, even if we are controlling the GPIO
+		* ourselves this bit needs to be at least set to 1, otherwise the spi
+		* peripheral will not send any data out.
+		*/
+		spi_enable_software_slave_management(SPI1);
+		spi_set_nss_high(SPI1);
+		
+		spi_enable_tx_dma(SPI1);
+
+		// Set to tx+rx mode
+		spi_set_unidirectional_mode(SPI1);
+
+		/* Enable SPI1 periph. */
+		spi_enable(SPI1);
+	}
+	void lcd_spi_write() {
+		spi_set_baudrate_prescaler(SPI1,SPI_CR1_BR_FPCLK_DIV_4);
+	}
+	void lcd_spi_read() {
+		spi_set_baudrate_prescaler(SPI1, SPI_CR1_BR_FPCLK_DIV_8);
+	}
+	void lcd_spi_slow() {
+		spi_set_baudrate_prescaler(SPI1, SPI_CR1_BR_FPCLK_DIV_16);
+	}
+	void spi_drop_read() {
+		(void)SPI_DR(SPI1); // Cleanup read buffers in SPI hardware
+		(void)SPI_DR(SPI1);
+	}
+	bool lcd_spi_isDMAInProgress = false;
+	
+	void lcd_spi_waitDMA() {
+		if(!lcd_spi_isDMAInProgress)
+			return;
+
+		// wait for dma finish
+		while(!dmaChannelSPI.finished());
+		dmaChannelSPI.stop();
+
+		// wait for all ongoing transfers to complete
+		while (!(SPI_SR(SPI1) & SPI_SR_TXE));
+		while ((SPI_SR(SPI1) & SPI_SR_BSY));
+		
+		lcd_spi_isDMAInProgress = false;
+//		delayMicroseconds(10);
+	}
+	
+	uint32_t lcd_spi_transfer(uint32_t sdi, int bits) {
+		if(lcd_spi_isDMAInProgress)
+			lcd_spi_waitDMA();
+		spi_drop_read();
+		uint32_t ret = spi_xfer(SPI1, (uint16_t) sdi);
+		if(bits == 16) {
+			ret|= uint32_t(spi_xfer(SPI1, (uint16_t) (sdi >> 8))) << 8;
+		}
+		return ret;
+	}
+
+	void lcd_spi_transfer_bulk(uint8_t* buf, int bytes) {
+		if(lcd_spi_isDMAInProgress)
+			lcd_spi_waitDMA();
+
+		lcd_spi_isDMAInProgress = true;
+		DMATransferParams srcParams, dstParams;
+		srcParams.address = buf;
+		srcParams.bytesPerWord = 1;
+		srcParams.increment = true;
+
+		dstParams.address = &SPI_DR(SPI1);
+		dstParams.bytesPerWord = 1;
+		dstParams.increment = false;
+
+		dmaChannelSPI.setTransferParams(srcParams, dstParams,
+								DMADirection::MEMORY_TO_PERIPHERAL,
+								bytes, false);
+		dmaChannelSPI.start();
+		//lcd_spi_waitDMA();
+	}
+
+	void lcd_spi_read_bulk(uint8_t* buf, int bytes) {
+		if(lcd_spi_isDMAInProgress)
+			lcd_spi_waitDMA();
+		// Switch to read speed
+		lcd_spi_read();
+		// Drop old data in rx buffers
+		spi_drop_read();
+#if 0
+		lcd_spi_isDMAInProgress = true;
+		DMATransferParams srcParams, dstParams;
+		srcParams.address = &SPI_DR(SPI1);
+		srcParams.bytesPerWord = 1;
+		srcParams.increment = false;
+
+		dstParams.address = buf;
+		dstParams.bytesPerWord = 1;
+		dstParams.increment = true;
+
+		dmaChannelSPI.setTransferParams(srcParams, dstParams,
+								DMADirection::PERIPHERAL_TO_MEMORY,
+								bytes, false);
+		dmaChannelSPI.start();
+		lcd_spi_waitDMA();
+#else
+		do{
+			*buf++= spi_xfer(SPI1, (uint16_t)0);
+		}while(--bytes);
 #endif
-    // SPI1のクロックは spi_slave_init() 内で有効化される
+		// Switch back to normal
+		lcd_spi_write();
+	}
 }
-
-// --- SysTick設定 ---
-static void systick_config(void) {
-    // 1msごとに割り込みを発生させる
-    systick_set_clocksource(STK_CSR_CLKSOURCE_AHB); // AHBクロックを使用 (F_CPU)
-    systick_set_reload(F_CPU / 1000 - 1); // 1ms
-    systick_interrupt_enable();
-    systick_counter_enable();
-}
-
-// --- SysTick割り込みハンドラ ---
-extern "C" void sys_tick_handler(void) {
-    system_millis++;
-}
-
-// --- LED制御 ---
-void led_set(bool on) {
-    if (on) {
-        gpio_bit_reset(LED_GREEN_PORT, LED_GREEN_PIN); // LED ON (カソードコモンの場合)
-    } else {
-        gpio_bit_set(LED_GREEN_PORT, LED_GREEN_PIN);   // LED OFF
-    }
-}
-
-// --- ボタン状態取得 ---
-bool button_pressed() {
-    return gpio_input_bit_get(BUTTON_PORT, BUTTON_PIN) == 0; // プルアップされていると仮定
-}
-
-
-// --- I2C 初期化 (Si5351用) ---
-#if BOARD_REVISION >= 2
-static void i2c_setup(void) {
-    // I2C0 ピン設定 (PB6: SCL, PB7: SDA)
-    gpio_mode_setup(GPIOB, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO6 | GPIO7);
-    gpio_set_output_options(GPIOB, GPIO_OTYPE_OD, GPIO_OSPEED_50MHZ, GPIO6 | GPIO7); // オープンドレイン
-    gpio_set_af(GPIOB, GPIO_AF_1, GPIO6 | GPIO7); // GD32F30x I2C0 AF1
-
-    i2c_reset(si5351_i2c_dev);
-    i2c_peripheral_disable(si5351_i2c_dev);
-    // I2Cクロック設定 (例: 100kHz)
-    // 詳細な設定は元のファームウェアのi2c設定を参照してください。
-    // i2c_set_clock_frequency(si5351_i2c_dev, I2C_CR2_FREQ_36MHZ); // APB1クロック周波数
-    // i2c_set_ccr(si5351_i2c_dev, 180); // 100kHz for 36MHz APB1
-    // i2c_set_trise(si5351_i2c_dev, 37);
-    i2c_enable_analog_noise_filter(si5351_i2c_dev);
-    i2c_enable_digital_noise_filter(si5351_i2c_dev, 1); // フィルタ値は調整
-    i2c_peripheral_enable(si5351_i2c_dev);
-}
-#endif
-
-
-// --- ボード初期化 ---
-void boardInit() {
-    rcu_config();
-    systick_config();
-
-    // GPIO初期化
-    // LEDピン設定
-    gpio_mode_setup(LED_GREEN_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_GREEN_PIN);
-    gpio_set_output_options(LED_GREEN_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, LED_GREEN_PIN);
-    led_set(false); // 初期状態はLEDオフ
-
-    // ボタンピン設定
-    gpio_mode_setup(BUTTON_PORT, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, BUTTON_PIN);
-
-    // LCD、タッチパネル関連の初期化を削除
-    // lcd_spi_pins(); // SPIピン設定は spi_slave_init() で行うため削除
-    // lcd_cs_init();  // CSピンはNSSとして spi_slave_init() で設定
-    // lcd_dc_init();
-    // lcd_rst_init();
-    // lcd_reset();
-    // lcd_spi_init(); // SPIマスター初期化は削除
-    // lcd_bl_init(100);
-    // touch_init();   // タッチパネル初期化は削除
-
-    // SPIスレーブ初期化を呼び出し
-    spi_slave_init();
-
-#if BOARD_REVISION >= 2
-    i2c_setup();    // Si5351用I2C初期化
-    si5351_init();  // Si5351初期化 (この関数は synthesizers.cpp などにあると想定)
-#endif
-
-    // USB CDC ACM 初期化 (必要であれば維持、不要なら削除)
-    // usb_serial_init(); // この関数がどこで定義されているか確認
-                         // もしUSB機能が不要であれば、関連する初期化も削除
-}
-
-// LCDおよびタッチパネル関連の関数実装を削除 (board.hpp からプロトタイプも削除済み)
-// ... (lcd_spi_transfer_bulk, touch_get_point などの実装があった場所) ...
-
-#if BOARD_REVISION >= 2
-void si5351_init() {
-    // Si5351の初期化処理 (synthesizers.cpp などにある実際の処理を呼び出すか、ここに実装)
-    // この関数は通常、I2C経由でSi5351レジスタを設定します。
-    // 例: synthesizers_init(); // もしこのような集約関数があれば
-}
-#endif
