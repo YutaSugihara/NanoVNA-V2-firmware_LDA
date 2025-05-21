@@ -1,56 +1,54 @@
 #ifndef SPI_CONFIG_H
 #define SPI_CONFIG_H
 
-// Define the board revision you are working with, if not already globally defined
-// This might influence some low-level configurations.
-// For board_v2_plus4, BOARD_REVISION is typically 4 or higher.
-// Ensure this aligns with your project's definitions.
-#ifndef BOARD_REVISION
-#define BOARD_REVISION 4
+#include "main.hpp" // complexf, freqHz_t, SWEEP_POINTS_MAX のため
+                    // もし main.hpp で定義されていない場合は、ここで直接 SWEEP_POINTS_MAX を定義
+
+// Makefile の EXTRA_CFLAGS から SWEEP_POINTS_MAX がグローバルに定義されていない場合
+#ifndef SWEEP_POINTS_MAX
+#define SWEEP_POINTS_MAX 201 // ご提示の EXTRA_CFLAGS に基づく
 #endif
 
-// Fixed Measurement Parameters (Adjust these values as needed)
-#define SPI_SLAVE_START_FREQ     50000UL    // Example: 50 kHz
-#define SPI_SLAVE_STOP_FREQ      900000000UL // Example: 900 MHz
-#define SPI_SLAVE_NUM_POINTS     201         // Must be <= SWEEP_POINTS_MAX from your build flags
-#define SPI_SLAVE_AVERAGE_N      1           // Example: 1 average
+// SPIコマンドコード (マスター → スレーブ)
+#define CMD_TRIGGER_SWEEP   0xA0 // 固定パラメータでVNA測定を開始
+#define CMD_REQUEST_DATA    0xB0 // 最新の観測データセットを要求
+#define CMD_REQUEST_STATUS  0xC0 // (オプション) VNAの状態を要求
 
-// SPI Commands (Master to Slave)
-#define CMD_TRIGGER_SWEEP   0xA0 // Trigger VNA measurement
-#define CMD_REQUEST_DATA    0xB0 // Request VNA data
-#define CMD_REQUEST_STATUS  0xC0 // Request VNA status (optional)
+// VNAステータスコード (スレーブ → マスター, CMD_REQUEST_STATUS用)
+#define STATUS_IDLE         0x01 // VNAはアイドル状態、トリガ待機中
+#define STATUS_MEASURING    0x02 // VNAは測定実行中
+#define STATUS_DATA_READY   0x03 // 測定完了、データ取得準備完了
+#define STATUS_BUSY         0x04 // 一般的なビジー状態 (例: 前のコマンド処理中)
+#define STATUS_ERROR        0xFE // エラー発生
+#define STATUS_UNKNOWN_CMD  0xFF // 未知のコマンド受信
 
-// VNA Status Codes (Slave to Master, in response to CMD_REQUEST_STATUS)
-#define STATUS_IDLE         0x01 // VNA is idle, ready for trigger
-#define STATUS_MEASURING    0x02 // VNA is currently measuring
-#define STATUS_DATA_READY   0x03 // VNA measurement complete, data is ready
-#define STATUS_BUSY         0x04 // VNA is busy with other SPI transaction
-#define STATUS_ERROR        0xFE // VNA error
+// 固定VNA測定パラメータ
+// TODO: アプリケーションの要求に応じてこれらの値を定義してください
+#define FIXED_START_FREQ    (freqHz_t)50000       // 例: 50kHz
+#define FIXED_STOP_FREQ     (freqHz_t)900000000   // 例: 900MHz
+#define FIXED_NUM_POINTS    (uint16_t)SWEEP_POINTS_MAX // スイープポイント数
+#define FIXED_AVERAGE_N     (uint16_t)1           // 平均化回数
+// 必要に応じて固定ゲイン設定などを追加
+// #define FIXED_GAIN1      0
+// #define FIXED_GAIN2      0
 
-// SPI Data Buffers
-// Max points defined by your build command (EXTRA_CFLAGS="-DSWEEP_POINTS_MAX=201")
-#define MAX_SWEEP_POINTS SPI_SLAVE_NUM_POINTS
 
-// Data structure for one measurement point
-// Frequency (4 bytes) + S11_real (4) + S11_imag (4) + S21_real (4) + S21_imag (4) = 20 bytes
-typedef struct {
-    float frequency;
-    float s11_real;
-    float s11_imag;
-    float s21_real;
-    float s21_imag;
-} VNADataPoint_t;
+// データ転送関連
+// 1データポイントの構成: 周波数(float), S11実部(float), S11虚部(float), S21実部(float), S21虚部(float)
+// 各floatは4バイト
+#define SPI_BYTES_PER_FLOAT         (4)
+#define SPI_NUM_COMPLEX_PARAMS      (2) // S11, S21
+#define SPI_FLOATS_PER_COMPLEX      (2) // 実部, 虚部
+#define SPI_BYTES_PER_DATA_POINT    (SPI_BYTES_PER_FLOAT + (SPI_NUM_COMPLEX_PARAMS * SPI_FLOATS_PER_COMPLEX * SPI_BYTES_PER_FLOAT)) // 周波数 + S11(re,im) + S21(re,im)
 
-// Size of the SPI command receive buffer
-#define SPI_CMD_RX_BUFFER_SIZE 8
+// SPI送受信バッファサイズ
+#define SPI_RX_BUFFER_SIZE  16  // 受信コマンドバッファサイズ (例: 16バイト)
+#define SPI_TX_CHUNK_SIZE   64  // 一度に送信するデータチャンクサイズ (例: 64バイト、SPI FIFOサイズやパフォーマンスを考慮して調整)
+                                // このサイズは SPI_BYTES_PER_DATA_POINT の倍数である必要はありませんが、
+                                // データ送信ロジックで適切に処理する必要があります。
 
-// Size of the SPI data transmit buffer (for one chunk of data)
-// This should be a multiple of VNADataPoint_t size and manageable for SPI transaction
-// For example, if SPI FIFO is small, send a few points at a time.
-// Let's define it to hold a certain number of points or a fixed byte size.
-// For now, let's make it large enough for a few data points.
-// Max data for 201 points is 201 * 20 bytes = 4020 bytes.
-// SPI TX buffer for individual transactions. Master will request data multiple times if needed.
-#define SPI_DATA_TX_CHUNK_SIZE (10 * sizeof(VNADataPoint_t)) // Send 10 points per chunk (200 bytes)
+// データ送信完了通知 (オプション)
+// マスターがデータ受信バイト数をカウントする場合、これは不要かもしれません
+// #define SPI_TX_DONE_MARKER    0xFFFFFFFF
 
 #endif // SPI_CONFIG_H

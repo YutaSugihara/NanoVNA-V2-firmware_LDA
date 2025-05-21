@@ -1,197 +1,97 @@
-#pragma once
-#include <libopencm3/stm32/adc.h>
-#include <libopencm3/stm32/rcc.h>
-#include <libopencm3/stm32/flash.h>
-#include <libopencm3/stm32/spi.h>
-#include <mculib/fastwiring.hpp>
-#include <mculib/softi2c.hpp>
-#include <mculib/softspi.hpp>
-#include <mculib/si5351.hpp>
-#include <mculib/adf4350.hpp>
-#include <mculib/dma_adc.hpp>
+        #ifndef BOARD_HPP
+        #define BOARD_HPP
 
-#include <array>
-#include <stdint.h>
-#include <libopencm3/stm32/f1/dma.h>
-#include <libopencm3/stm32/adc.h>
+        #include <libopencm3/stm32/rcc.h>
+        #include <libopencm3/stm32/gpio.h>
+        #include <libopencm3/stm32/spi.h>
+        #include <libopencm3/stm32/usart.h>
+        #include <libopencm3/stm32/flash.h>
+        #include <libopencm3/stm32/desig.h>
+        #include <libopencm3/cm3/systick.h>
+        #include <libopencm3/cm3/scb.h>
+        #include <mculib/fastwiring.hpp>
+        #include <mculib/dma_adc.hpp>
+        #include <mculib/si5351.hpp>
+        #include <mculib/adf4350.hpp>
+        #include <mculib/softspi.hpp>
+        // #include "ili9341.hpp" // LCD削除のためコメントアウト
+        // #include "xpt2046.hpp" // タッチパネル削除のためコメントアウト
+        #include "rfsw.hpp"
+        #include "main.hpp" // For complexf, freqHz_t etc.
 
-#include "../rfsw.hpp"
-#include "../common.hpp"
-#include "../xpt2046.hpp"
-
-#define BOARD_NAME "NanoVNA V2Plus4"
-#define BOARD_REVISION (4)
-#define BOARD_REVISION_MAGIC 0xdeadbabf
-#define USB_POINTS_MAX 65536
-// Plus4 not use ecal mode
-#define BOARD_DISABLE_ECAL
-
-using namespace mculib;
-using namespace std;
-
-// This not used in Plus4 code, need only for bootloader
-#define BOARD_MEASUREMENT_NPERIODS_NORMAL		14
-#define BOARD_MEASUREMENT_NPERIODS_CALIBRATING	30
-#define BOARD_MEASUREMENT_ECAL_INTERVAL			 5
-#define BOARD_MEASUREMENT_NWAIT_SWITCH			 1
-#define BOARD_MEASUREMENT_MIN_CALIBRATION_AVG	10
-#define BOARD_MEASUREMENT_MAX_CALIBRATION_AVG	255
-#define BOARD_MEASUREMENT_FIRST_POINT_WAIT     128
-
-namespace board {
-
-	// ##### pin assignments #####
-
-	static constexpr Pad led = PA6;
-	static constexpr Pad led2 = PA7;
-	static constexpr Pad USB0_DP = PA12;
-	static constexpr Pad USB0_DM = PA11;
-
-	static constexpr array<Pad, 2> RFSW_ECAL = {PC13, PC14};
-	static constexpr array<Pad, 2> RFSW_BBGAIN = {PB15, PB14};
-	static constexpr Pad RFSW_TXSYNTH = PA5;
-	static constexpr Pad RFSW_RXSYNTH = PA10;
-	static constexpr Pad RFSW_REFL = PA8;
-	static constexpr Pad RFSW_RECV = PA9;
-
-	
-	static constexpr Pad lcd_clk = PB3;
-	static constexpr Pad lcd_mosi = PB5;
-	static constexpr Pad lcd_miso = PB4;
-	static constexpr Pad ili9341_cs = PA15;
-	static constexpr Pad ili9341_dc = PB6;
-	static constexpr Pad xpt2046_cs = PB7;
-	static constexpr Pad xpt2046_irq = PB8;
-
-	static constexpr Pad LEVER_LEFT = PB11;
-	static constexpr Pad LEVER_CENTER = PB12;
-	static constexpr Pad LEVER_RIGHT = PB13;
-	static constexpr bool LEVER_POLARITY = false; // pin level when lever/button is pressed
-
-	// ##### board parameters #####
-	
-	// estimated HSE frequency in Hz, set by boardInit()
-	extern uint32_t hseEstimateHz;
-
-	// All boards use a 24Mhz TCXO. It gives best phase noise with the ADF4350
-	static constexpr uint32_t xtalFreqHz = 24000000;
-	static constexpr freqHz_t DEFAULT_FREQ = 2600000000;
-
-	// ADC parameters, set by boardInit()
-	extern uint32_t adc_ratecfg;
-	extern uint32_t adc_srate; // Hz
-	extern uint32_t adc_period_cycles, adc_clk;
-	constexpr int adc_rxChannel = 0;
-
-	// the end of flash memory. User data is stored before this point.
-	constexpr uint32_t USERFLASH_END = 0x08000000 + 256*1024;
+        // <<< SPI Slave 追加 >>>
+        #include "spi_slave.hpp" // SPIスレーブドライバのヘッダをインクルード
+        // <<< SPI Slave 追加終わり >>>
 
 
-	// ##### board peripherals #####
+        #define BOARD_REVISION 6 // NanoVNA V2 Plus4 (board_v2_plus4.hpp内での定義に合わせる)
 
-	extern DMADriver dma;
-	extern DMAChannel dmaChannelADC;
-	extern DMAADC dmaADC;
+        // Pin definitions
+        #define PIN_BUTTON PA0
+        #define PIN_LED PC13
 
-	// synthesizers
+        // Synthesizer SPI
+        #define PIN_SYNTH_MOSI PB15
+        #define PIN_SYNTH_MISO PB14
+        #define PIN_SYNTH_SCK PB13
 
-	struct i2cDelay_t {
-		void operator()() {
-			_delay_8t(5);
-		}
-	};
-	struct spiDelay_t {
-		void operator()() {
-			_delay_8t(2);
-		}
-	};
+        // ADF4350 pins
+        #define PIN_ADF_CS PB12
+        #define PIN_ADF_LD PA8
 
-	extern SoftI2C<i2cDelay_t> si5351_i2c;
-	extern Si5351::Si5351Driver si5351;
+        // SI5351 pins
+        #define PIN_SI_SDA PB7
+        #define PIN_SI_SCL PB6
 
-	extern SoftSPI<spiDelay_t> adf4350_tx_spi;
-	extern SoftSPI<spiDelay_t> adf4350_rx_spi;
+        // ADC pins
+        #define PIN_ADC_CH0 PA1   // Reflection ADC
+        #define PIN_ADC_CH1 PA2   // Transmission ADC
+        #define PIN_ADC_CH2 PA3   // Reference ADC
+        // #define PIN_ADC_VREF PA0  // PA0 is PIN_BUTTON now
 
-	struct adf4350_sendWord_t {
-		SoftSPI<spiDelay_t>& spi;
-		void operator()(uint32_t word) {
-			spi.beginTransfer();
-			spi.doTransfer_send(word, 32);
-			spi.endTransfer();
-		}
-	};
-	extern ADF4350::ADF4350Driver<adf4350_sendWord_t> adf4350_tx;
-	extern ADF4350::ADF4350Driver<adf4350_sendWord_t> adf4350_rx;
+        // RF switch control pins
+        #define PIN_SW_CTL0 PB0  // S11/S21 switch
+        #define PIN_SW_CTL1 PB1  // S11/S21 switch
 
-	constexpr int si5351_rxPLL = 0, si5351_txPLL = 1;
-	constexpr int si5351_rxPort = 0, si5351_txPort = 2, si5351_passthruPort = -1;
+        // SPI Slave pins (repurposed from LCD/Touch SPI1)
+        #define PIN_SLAVE_SPI_SCK  PA5 // 元 lcd_clk
+        #define PIN_SLAVE_SPI_MISO PA6 // 元 lcd_miso
+        #define PIN_SLAVE_SPI_MOSI PA7 // 元 lcd_mosi
+        #define PIN_SLAVE_SPI_NSS  PA4 // 元 lcd_cs (SPI1_NSS)
 
-	// lcd display
+        // Function prototypes
+        void boardInitPre(void);
+        void boardInit(void);
+        void boardNMI(void);
+        void boardHardfault(void);
+        void boardSysTick(void);
+        void boardSleep(uint32_t msec);
+        void boardSetLED(bool on);
 
-	extern XPT2046 xpt2046;
+        // RF switch functions
+        extern RFSW rfsw;
+        void rfswInit(void);
 
-	// rf switch positions
+        // Synthesizer functions
+        extern SoftSPI synthSPI;
+        extern Si5351 si5351;
+        extern ADF4350 adf4350;
+        void synthInit(void);
+        void synthSetFrequency(uint32_t freq);
+        uint32_t synthGetFrequency(void);
+        void synthSetPower(uint8_t power); // 0-3 for ADF4350
+        void synthSetReference(bool external);
+        void synthSetOutput(bool on);
 
-	static constexpr auto RFSW_ECAL_SHORT = RFSWState::RF4;
-	static constexpr auto RFSW_ECAL_OPEN = RFSWState::RF3;
-	static constexpr auto RFSW_ECAL_LOAD = RFSWState::RF2;
-	static constexpr auto RFSW_ECAL_NORMAL = RFSWState::RF1;
+        // ADC functions
+        extern DMA_ADC dma_adc;
+        void adcInit(void);
+        void adcRead(uint16_t *sample_buf, int num_samples);
 
-	static constexpr int RFSW_TXSYNTH_LF = 0;
-	static constexpr int RFSW_TXSYNTH_HF = 1;
+        // <<< SPI Slave 追加 >>>
+        extern SPISlave spi_slave;
+        // void spi_slave_init_board(); // SPISlave::init() で十分な場合は不要
+        // <<< SPI Slave 追加終わり >>>
 
-	static constexpr int RFSW_RXSYNTH_LF = 1;
-	static constexpr int RFSW_RXSYNTH_HF = 0;
-
-	static constexpr int RFSW_REFL_ON = 1;
-	static constexpr int RFSW_REFL_OFF = 0;
-
-	static constexpr int RFSW_RECV_REFL = 0;
-	static constexpr int RFSW_RECV_PORT2 = 1;
-
-	static constexpr int RFSW_BBGAIN_MAX = 3;
-
-	// gain is an integer from 0 to 3, 0 being lowest gain
-	static inline RFSWState RFSW_BBGAIN_GAIN(int gain) {
-		switch(gain) {
-			case 0: return RFSWState::RF1;
-			case 1: return RFSWState::RF2;
-			case 2: return RFSWState::RF3;
-			case 3: return RFSWState::RF4;
-			default: return RFSWState::RF4;
-		}
-		return RFSWState::RF4;
-	}
-
-	// call this function at the beginning of main()
-	void boardInit();
-
-	// returns an estimate of the HSE frequency in Hz.
-	// called by boardInit() to set hseEstimateHz.
-	uint32_t detectHSEFreq();
-
-	// blink the status led
-	void ledPulse();
-	
-	int calculateSynthWaitAF(freqHz_t freqHz);
-	int calculateSynthWaitSI(int retval);
-
-	// sets up hardware spi for ili9341 and touch.
-	// spi peripheral only manages clk, sdi, and sdo.
-	void lcd_spi_init();
-
-	// three speed presets for ili9341 write/read and touch controller
-	void lcd_spi_write();
-	void lcd_spi_read();
-	void lcd_spi_slow();
-
-	// bits must be 16 or 8
-	uint32_t lcd_spi_transfer(uint32_t sdi, int bits);
-
-	void lcd_spi_transfer_bulk(uint8_t* buf, int bytes);
-
-	void lcd_spi_read_bulk(uint8_t* buf, int bytes);
-
-	// wait for all bulk transfers to complete
-	void lcd_spi_waitDMA();
-}
+        #endif // BOARD_HPP
+        

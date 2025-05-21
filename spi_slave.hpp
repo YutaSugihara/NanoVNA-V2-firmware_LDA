@@ -1,42 +1,57 @@
 #ifndef SPI_SLAVE_HPP
 #define SPI_SLAVE_HPP
 
+#include <libopencm3/stm32/spi.h>
+#include <libopencm3/stm32/gpio.h>
 #include <libopencm3/cm3/nvic.h>
-#include <libopencm3/gd32/f3/spi.h> // Adjust path if different for your libopencm3 setup
-#include "common.hpp" // For complexf
-#include "spi_config.h" // For definitions
+#include "spi_config.h" // For buffer sizes and command definitions
+#include "fifo.hpp"     // リングバッファ用 (SimpleFIFO を想定)
 
-// SPI peripheral to be used (SPI1)
-#define VNA_SPI_PERIPH SPI1
+// SPIスレーブ通信を処理するクラス
+class SPISlave {
+public:
+    SPISlave();
 
-// Maximum number of data points to buffer for transmission
-// This buffer holds the entire sweep data
-extern VNADataPoint_t spiVnaDataBuffer[MAX_SWEEP_POINTS];
-extern volatile uint16_t spiVnaDataBufferCount; // Number of valid data points in spiVnaDataBuffer
-extern volatile bool spiDataReadyFlag;          // Flag indicating a full sweep data is ready
-extern volatile bool spiMeasurementInProgressFlag; // Flag indicating measurement is ongoing
+    // SPIスレーブの初期化
+    void init();
 
-// Initialize SPI1 in slave mode
-void spi_slave_init(void);
+    // SPI割り込みハンドラ (spi1_isr から呼び出される)
+    void handle_interrupt();
 
-// Process received SPI command
-void spi_process_command(uint8_t cmd);
+    // 受信コマンドFIFOから1バイト読み出し
+    // データがない場合は false を返す
+    bool read_command(uint8_t& cmd);
 
-// Prepare data for SPI transmission (called when CMD_REQUEST_DATA is received)
-// This function will load the next chunk of data into the SPI TX FIFO or a temporary TX buffer
-// that the ISR will use.
-void spi_prepare_data_for_tx(void);
+    // 送信データバッファにデータを準備 (単一バイト)
+    void prepare_tx_byte(uint8_t data);
 
-// Get current VNA status for SPI transmission
-uint8_t spi_get_status(void);
+    // 送信データバッファに複数バイトのデータを準備
+    // len バイトのデータをバッファリングする
+    // バッファオーバーフローに注意
+    void prepare_tx_data(const uint8_t* data, uint16_t len);
 
-// Call this from main loop to handle SPI related tasks that are not in ISR
-void spi_slave_poll(void);
+    // 現在のVNAステータスを取得 (main2.cpp で管理される状態に基づく)
+    // この関数はSPISlaveクラスの外部で実装され、SPISlaveから呼び出されることを想定
+    // または、SPISlaveが状態を直接管理するように変更することも可能
+    // uint8_t get_vna_status(); // このプロトタイプは例
 
-// Functions to be called from measurement routines
-void spi_slave_notify_measurement_start(void);
-void spi_slave_notify_measurement_complete(void);
-void spi_slave_buffer_data_point(uint32_t freq_hz, complexf s11, complexf s21);
+private:
+    // SPIピンの初期化
+    void gpio_init();
+    // SPIペリフェラルの初期化
+    void spi_peripheral_init();
+    // SPI割り込みの初期化
+    void nvic_init();
 
+    // 受信コマンドを格納するリングバッファ
+    SimpleFIFO<uint8_t, SPI_RX_BUFFER_SIZE> rx_fifo;
+    // 送信データを格納するリングバッファ
+    SimpleFIFO<uint8_t, SPI_TX_CHUNK_SIZE * 2> tx_fifo; // 送信チャンクサイズより大きめに確保
+
+    volatile bool tx_active; // 送信中フラグ
+};
+
+// グローバルなSPISlaveインスタンスへのポインタ (ISRからアクセスするため)
+// extern SPISlave* g_spi_slave_ptr; // main2.cpp で実体を定義する場合
 
 #endif // SPI_SLAVE_HPP
