@@ -1,15 +1,29 @@
-# paths to libraries
+# ライブラリへのパス
 MCULIB         ?= mculib
 OPENCM3_DIR    ?= libopencm3
-BOOTLOAD_PORT       ?= /dev/ttyACM0
+BOOTLOAD_PORT  ?= /dev/ttyACM0
 
-# device config
-BOARDNAME       ?= board_v2_plus4
-EXTRA_CFLAGS	?= -DDISPLAY_ST7796
+# デバイス設定
+BOARDNAME      ?= board_v2_plus4
 
-DEVICE          = gd32f303cc_nofpu
+# DEVICE は libopencm3 のビルドシステムで使用されます
+# これに基づいて TARGET_ARCH_CFLAGS や TARGET_ARCH_CXXFLAGS に適切なファミリー定義が設定されるはずです。
+DEVICE         := gd32f303cc_nofpu # GD32F303CC (Cortex-M4, FPUなし)
 
-OBJS += $(BOARDNAME)/board.o \
+# プロジェクト固有の定義 (コマンドラインからの EXTRA_CFLAGS で上書き可能)
+# ★★★ GD32ファミリー定義とmculibデバイス定義をここに集約 ★★★
+# libopencm3のgcc-config.mkが設定するDEFSにもファミリー定義が含まれるはずだが、念のため明示。
+# お使いのlibopencm3/mculibが期待する正確なマクロ名に合わせて調整が必要な場合があります。
+PROJECT_DEFINES := \
+    -DGD32F30X_HD \
+    -DMCULIB_DEVICE_GD32F3 \
+    -DSWEEP_POINTS_MAX=201 \
+    -DSAVEAREA_MAX=7 \
+    -DDISPLAY_ST7796
+
+# ソースファイル一覧
+OBJS += \
+    $(BOARDNAME)/board.o \
     Font5x7.o \
     Font7x13b.o \
     command_parser.o \
@@ -17,7 +31,6 @@ OBJS += $(BOARDNAME)/board.o \
     fft.o \
     flash.o \
     gain_cal.o \
-    gitversion.hpp \
     globals.o \
     ili9341.o \
     main2.o \
@@ -30,60 +43,73 @@ OBJS += $(BOARDNAME)/board.o \
     uihw.o \
     vna_measurement.o \
     xpt2046.o \
-    $(NULL)
+    spi_slave.o
 
-OBJS	+= \
-	$(MCULIB)/dma_adc.o \
-	$(MCULIB)/dma_driver.o \
-	$(MCULIB)/fastwiring.o \
-	$(MCULIB)/message_log.o \
-	$(MCULIB)/printf.o \
-	$(MCULIB)/si5351.o \
-	$(MCULIB)/usbserial.o
+OBJS    += \
+    $(MCULIB)/dma_adc.o \
+    $(MCULIB)/dma_driver.o \
+    $(MCULIB)/fastwiring.o \
+    $(MCULIB)/message_log.o \
+    $(MCULIB)/printf.o \
+    $(MCULIB)/si5351.o \
+    $(MCULIB)/usbserial.o
 
-CFLAGS         += -O2 -g
-CPPFLAGS       += $(EXTRA_CFLAGS) -O2 -g -ffast-math -fstack-protector-strong -I$(BOARDNAME) -I$(MCULIB)/include -DMCULIB_DEVICE_STM32F103 -DSTM32F103 -DSTM32F1 -D_XOPEN_SOURCE=600
-CPPFLAGS       += -Wall -Wno-unused-function -Werror=implicit-fallthrough
-# CPPFLAGS      += -DDISPLAY_ST7796
-CPPFLAGS       +=  -ffunction-sections -fdata-sections
-# C++ only flags, CPP is used for both C++ and C files
-CXXFLAGS       += --std=c++17 -fno-exceptions -fno-rtti
+# 基本的な最適化とデバッグ情報
+OPT             = -O2
+DEBUGINFO       = -g
 
-# safe g++ flags
-CPPFLAGS       += -funsigned-char -fwrapv -fno-delete-null-pointer-checks -fno-strict-aliasing
+# インクルードパス
+INCLUDE_DIRS   += -I$(BOARDNAME) -I$(MCULIB)/include -I$(OPENCM3_DIR)/include
 
-LDFLAGS        += -static -nostartfiles -Wl,--exclude-libs,libssp -Wl,--print-memory-usage
-LDFLAGS        += -Wl,--gc-sections
+# CとC++共通のフラグ (プロジェクト定義とコマンドラインからのEXTRA_CFLAGSを含む)
+# libopencm3 の gcc-config.mk が ARCH_FLAGS と DEFS (MCUファミリー定義を含むべき) を設定
+include $(OPENCM3_DIR)/mk/genlink-config.mk # genlink_family などが設定される
+include $(OPENCM3_DIR)/mk/gcc-config.mk     # ARCH_FLAGS, TOOLCHAIN_PREFIX, DEFS などが設定される
+
+# 共通フラグに ARCH_FLAGS と DEFS を含める
+# さらにプロジェクト固有の定義とコマンドラインからの EXTRA_CFLAGS を追加
+BASE_COMMON_FLAGS = $(ARCH_FLAGS) $(DEFS) $(OPT) $(DEBUGINFO) \
+                    -Wall -Wno-unused-function -Werror=implicit-fallthrough \
+                    -ffunction-sections -fdata-sections \
+                    -funsigned-char -fwrapv -fno-delete-null-pointer-checks -fno-strict-aliasing \
+                    -D_XOPEN_SOURCE=600
+
+# CFLAGS と CXXFLAGS を構成
+# DEFS には libopencm3 の gcc-config.mk が設定するデバイスファミリー定義が含まれるはず
+# COMMON_FLAGS には PROJECT_DEFINES (GD32F30X_HD, MCULIB_DEVICE_GD32F3 など) と EXTRA_CFLAGS が含まれる
+CFLAGS          = $(BASE_COMMON_FLAGS) $(PROJECT_DEFINES) $(EXTRA_CFLAGS) $(INCLUDE_DIRS)
+CXXFLAGS        = $(BASE_COMMON_FLAGS) $(PROJECT_DEFINES) $(EXTRA_CFLAGS) $(INCLUDE_DIRS) --std=c++17 -fno-exceptions -fno-rtti
+
+LDFLAGS        += -static -nostartfiles -Wl,--exclude-libs,libssp
+LDFLAGS        += -Wl,--gc-sections $(ARCH_LDFLAGS) # ARCH_LDFLAGS を追加
 LDLIBS         += -Wl,--start-group -lgcc -lnosys -Wl,--end-group -lm
 
-GITVERSION      = "$(shell git log -n 1 --pretty=format:"git-%ad%h" --date=format:"%Y%m%d-")"
-GITURL          = "$(shell git config --get remote.origin.url)"
+GITVERSION_FILE = gitversion.hpp
 
-# This is needed for the included genlink-config.mk to work properly
-LIBNAME         = opencm3_$(genlink_family)
-OPENCM3_LIB     = $(OPENCM3_DIR)/lib/lib$(LIBNAME).a
+# リンカスクリプト (コマンドラインから LDSCRIPT で上書き可能)
+LDSCRIPT ?= ./gd32f303cc_with_bootloader_plus4.ld
 
-include $(OPENCM3_DIR)/mk/genlink-config.mk
-include $(OPENCM3_DIR)/mk/gcc-config.mk
+.PHONY: all clean dist-clean flash bootload_firmware dfu
 
-LDSCRIPT=./gd32f303cc_with_bootloader_plus4.ld
+all: $(GITVERSION_FILE) $(OPENCM3_LIB) binary.elf binary.hex binary.bin
 
-.PHONY: dist-clean clean all
-
-all: $(OPENCM3_LIB) binary.elf binary.hex binary.bin
-
+# libopencm3 ライブラリのビルド
+# DEVICE 変数がこの makefile インスタンスからサブの make に渡されるようにする
 $(OPENCM3_LIB):
-	$(MAKE) -C $(OPENCM3_DIR)
+	$(MAKE) -C $(OPENCM3_DIR) DEVICE=$(DEVICE)
 
-gitversion.hpp: .git/HEAD .git/index
-	echo "#define GITVERSION \"$(GITVERSION)\"" > $@
-	echo "#define GITURL \"$(GITURL)\"" >> $@
+$(GITVERSION_FILE): .git/HEAD .git/index
+	@echo "#define GITVERSION \"$(shell git log -n 1 --pretty=format:"git-%ad%h" --date=format:"%Y%m%d-")\"" > $@
+	@echo "#define GITURL \"$(shell git config --get remote.origin.url)\"" >> $@
 
+# クリーンルール修正
 clean:
-	$(Q)$(RM) -rf binary.* *.o $(BOARDNAME)/*.o
+	$(Q)$(RM) -f binary.elf binary.hex binary.bin binary.map \
+	             $(OBJS) $(GITVERSION_FILE) \
+	             $(BOARDNAME)/*.o $(MCULIB)/*.o *.o
 
 dist-clean: clean
-	make -C $(OPENCM3_DIR) clean
+	$(MAKE) -C $(OPENCM3_DIR) clean
 
 flash: binary.hex
 	./st-flash --reset --format ihex write binary.hex
@@ -91,5 +117,7 @@ flash: binary.hex
 bootload_firmware dfu: binary.bin
 	python3 bootload_firmware.py --file $< --serial $(BOOTLOAD_PORT)
 
-include $(OPENCM3_DIR)/mk/genlink-rules.mk
-include $(OPENCM3_DIR)/mk/gcc-rules.mk
+# libopencm3 のルールファイルをインクルード
+# これらが .c.o や .cpp.o の汎用ルール、および .elf のリンクステップルールを提供する
+include $(OPENCM3_DIR)/mk/gcc-rules.mk # .c.o, .S.o などのコンパイルルール
+include $(OPENCM3_DIR)/mk/genlink-rules.mk # .elf, .bin, .hex などの生成ルール

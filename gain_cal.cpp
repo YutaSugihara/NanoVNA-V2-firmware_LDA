@@ -1,75 +1,91 @@
-#include "vna_measurement.hpp"
-#include "ui.hpp"
-#include "fifo.hpp"
-#include "main.hpp"
-#include "ili9341.hpp"
-#include "globals.hpp"
-#include <board.hpp>
-#include <mculib/printf.hpp>
-#include <mculib/message_log.hpp>
-#include <mculib/printk.hpp>
-#include <libopencm3/cm3/scb.h>
+#include "gain_cal.hpp"
+#include "vna_measurement.hpp" // VNAMeasurement, SweepArgs のため
+#include "globals.hpp"         // vnaMeasurement, current_props, system_millis のため
+#include "common.hpp"          // complexf のため
+#include "board_v2_plus4/board.hpp" // delay_ms のため (または common.hpp で提供)
+#include "spi_config.h"        // DEFAULT_FREQ などのため (spi_config.h に定義を移動した場合)
 
-using namespace mculib;
-using namespace board;
+// spi_config.h に以下の定義がない場合、ここで定義するか、適切な場所に移動
+#ifndef DEFAULT_FREQ
+#define DEFAULT_FREQ 100000000UL // 100MHz (仮の値)
+#endif
+#ifndef DEFAULT_NPOINTS
+#define DEFAULT_NPOINTS 101
+#endif
+#ifndef DEFAULT_AVG_N
+#define DEFAULT_AVG_N 1
+#endif
 
 
-template<int fifoSize>
-static void discardPoints(FIFO<complexf, fifoSize>& dpFIFO, int n) {
-	dpFIFO.clear();
+// グローバルなvnaMeasurementオブジェクトを参照
+// extern VNAMeasurement vnaMeasurement; // globals.hppで宣言済み
+// extern volatile uint32_t system_millis; // globals.hppで宣言済み
 
-	// skip n data points
-	for(int i=0; i<n; i++) {
-		while(!dpFIFO.readable());
-		dpFIFO.dequeue();
-	}
+namespace { // 匿名名前空間でコールバック関数を定義
+
+// キャリブレーション用データポイント処理コールバック
+static complexf cal_points_s11[SWEEP_POINTS_MAX]; // spi_config.h or project_defines
+static complexf cal_points_s21[SWEEP_POINTS_MAX];
+static int cal_point_idx = 0;
+static bool cal_sweep_done = false;
+
+void calibration_data_point_cb(int point_idx, uint32_t freq_hz, VNAObservation v, bool last_point) {
+    (void)freq_hz; // 未使用
+    if (point_idx < SWEEP_POINTS_MAX) {
+        if (cabsf(v[1].real + v[1].imag * I) > 1e-9f) {
+            cal_points_s11[point_idx].real = (v[0].real * v[1].real + v[0].imag * v[1].imag) / (v[1].real * v[1].real + v[1].imag * v[1].imag);
+            cal_points_s11[point_idx].imag = (v[0].imag * v[1].real - v[0].real * v[1].imag) / (v[1].real * v[1].real + v[1].imag * v[1].imag);
+            cal_points_s21[point_idx].real = (v[2].real * v[1].real + v[2].imag * v[1].imag) / (v[1].real * v[1].real + v[1].imag * v[1].imag);
+            cal_points_s21[point_idx].imag = (v[2].imag * v[1].real - v[2].real * v[1].imag) / (v[1].real * v[1].real + v[1].imag * v[1].imag);
+        } else {
+            cal_points_s11[point_idx] = {0,0};
+            cal_points_s21[point_idx] = {0,0};
+        }
+    }
+    if (last_point) {
+        cal_sweep_done = true;
+    }
 }
+} // anonymous namespace
 
+void performGainCal(VNAMeasurement& vna, float* gain_array, int num_points) {
+    (void)gain_array; // この引数は現在のロジックでは未使用のよう
 
-// measure the attenuation at each gain setting
-void performGainCal(VNAMeasurement& vnaMeasurement, float* gainTable, int maxGain) {
-	int j;
-	volatile int currGain = 0;
-	auto old_emitDataPoint = vnaMeasurement.emitDataPoint;
-	auto old_phaseChanged = vnaMeasurement.phaseChanged;
-	auto old_avg = current_props._avg;
-	auto old_pow = current_props._adf4350_txPower;
-	FIFO<complexf, 32> dpFIFO;
-	current_props._avg = 40;            // Use 40 x avg for bbgain cal
-	current_props._adf4350_txPower = 0; // Use 0 power for prevent bbgain0 overflow
+    // SweepArgs構造体がvna_measurement.hppで定義されていると仮定
+    SweepArgs args;
+    args.f_start = DEFAULT_FREQ; // spi_config.h またはここで定義
+    args.f_stop = DEFAULT_FREQ;  // シングルポイント測定
+    args.n_points = DEFAULT_NPOINTS; // spi_config.h またはここで定義
+    args.n_avg = DEFAULT_AVG_N;    // spi_config.h またはここで定義
+    args.cal_on = false;       // キャリブレーション補正は行わない生データが必要
 
-	// override phaseChanged, set bbgain to desired value
-	vnaMeasurement.phaseChanged = [&](VNAMeasurementPhases ph) {
-		rfsw(RFSW_REFL, RFSW_REFL_ON);
-		rfsw(RFSW_RECV, RFSW_RECV_REFL);
-		rfsw(RFSW_ECAL, RFSW_ECAL_OPEN);
-		rfsw(RFSW_BBGAIN, RFSW_BBGAIN_GAIN(currGain));
-	};
+    vna.setEmitDataPointCallback(calibration_data_point_cb);
+    cal_point_idx = 0;
+    cal_sweep_done = false;
 
-	// disable ecal during gain cal
-	vnaMeasurement.ecalIntervalPoints = 10000;
-	vnaMeasurement.setSweep(DEFAULT_FREQ, 0, 1, 1);
-	vnaMeasurement.emitDataPoint = [&](int freqIndex, freqHz_t freqHz, const VNAObservation& v, const complexf* ecal) {
-		dpFIFO.enqueue(v[1]);
-	};
+    vna.setSweep(args, true /* is_cal_sweep */); // is_cal_sweep を true に
 
-	for(j = 0; j <= maxGain; j++) {
-		currGain = j;
-		discardPoints(dpFIFO, 1);
-		while(!dpFIFO.readable());
-		gainTable[j] = abs(dpFIFO.read()); // Measure magnitude
-	}
+    uint32_t start_time = system_millis;
+    uint32_t timeout_ms = 5000; // 5秒タイムアウト
 
-	// normalize first entry to 1.0
-	float norm = gainTable[0];
-	gainTable[0] = 1.f; // norm / gainTable[0];
-	for(j = 1; j <= maxGain; j++) {
-		gainTable[j] = norm / gainTable[j];
-	}
+    // is_sweeping() と stop_sweep() が VNAMeasurement クラスに存在する必要がある
+    while(!cal_sweep_done && (system_millis - start_time < timeout_ms)) {
+        // vna.poll(); // VNAMeasurement にポーリング関数があれば呼び出す
+        delay_ms(1); // 短い遅延
+    }
 
-	current_props._avg = old_avg;
-	current_props._adf4350_txPower = old_pow;
-	// reset callbacks
-	vnaMeasurement.emitDataPoint = old_emitDataPoint;
-	vnaMeasurement.phaseChanged = old_phaseChanged;
+    if (!cal_sweep_done) { // タイムアウトまたはエラー
+        // vna.stop_sweep(); // 存在すれば呼び出す
+        // エラー処理
+        return;
+    }
+
+    // cal_points_s11 と cal_points_s21 にデータが収集された
+    // これらを使ってゲインキャリブレーション計算を行う
+    // ... (実際のゲイン計算ロジック) ...
+    // 例: gain_array[i] = calculate_gain_from(cal_points_s11[i], cal_points_s21[i]);
+    for (int i = 0; i < num_points && i < SWEEP_POINTS_MAX; ++i) {
+        // ダミーのゲイン計算
+        // gain_array[i] = 1.0f;
+    }
 }

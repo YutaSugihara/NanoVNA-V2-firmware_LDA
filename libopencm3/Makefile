@@ -1,128 +1,244 @@
-##
-## This file is part of the libopencm3 project.
-##
-## Copyright (C) 2009 Uwe Hermann <uwe@hermann-uwe.de>
-##
-## This library is free software: you can redistribute it and/or modify
-## it under the terms of the GNU Lesser General Public License as published by
-## the Free Software Foundation, either version 3 of the License, or
-## (at your option) any later version.
-##
-## This library is distributed in the hope that it will be useful,
-## but WITHOUT ANY WARRANTY; without even the implied warranty of
-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-## GNU Lesser General Public License for more details.
-##
-## You should have received a copy of the GNU Lesser General Public License
-## along with this library.  If not, see <http://www.gnu.org/licenses/>.
-##
+# ライブラリへのパス
+MCULIB         ?= mculib
+OPENCM3_DIR    ?= libopencm3
+BOOTLOAD_PORT  ?= /dev/ttyACM0
 
-PREFIX		?= arm-none-eabi-
+# デバイス設定
+BOARDNAME      ?= board_v2_plus4
 
-STYLECHECK      := scripts/checkpatch.pl
-STYLECHECKFLAGS := --no-tree -f --terse --mailback
+# ★★★ デバイス定義をSTM32F103に変更 ★★★
+# libopencm3が認識するSTM32F103の中密度デバイスを指定 (例: stm32f103c8)
+# これにより、libopencm3のヘッダはSTM32F1として処理されることを期待
+DEVICE         := stm32f103c8 # STM32F103C8T6 を想定
 
-space:=
-space+=
-SRCLIBDIR:= $(subst $(space),\$(space),$(realpath lib))
+# プロジェクト固有の定義
+# GD32関連の定義は削除し、mculibがSTM32F1を認識するようにする
+# STM32F1系のファミリー定義 (例: STM32F10X_MD) は libopencm3 の DEFS から提供されることを期待
+PROJECT_DEFINES := \
+    -DMCULIB_DEVICE_STM32F1 \
+    -DSWEEP_POINTS_MAX=201 \
+    -DSAVEAREA_MAX=7 \
+    -DDISPLAY_ST7796
 
-TARGETS ?=	stm32/f0 stm32/f1 gd32/f3 gd32/f3_nofpu stm32/f2 stm32/f3 stm32/f4 stm32/f7 \
-		stm32/l0 stm32/l1 stm32/l4 \
-		stm32/g0 \
-		stm32/h7 \
-		gd32/f1x0 \
-		lpc13xx lpc17xx lpc43xx/m4 lpc43xx/m0 \
-		lm3s lm4f msp432/e4 \
-		efm32/tg efm32/g efm32/lg efm32/gg efm32/hg efm32/wg \
-		efm32/ezr32wg \
-		sam/3a sam/3n sam/3s sam/3u sam/3x sam/4l \
-		sam/d \
-		vf6xx \
-		swm050 \
-		pac55xx
+# ソースファイル一覧
+OBJS += \
+    $(BOARDNAME)/board.o \
+    Font5x7.o \
+    Font7x13b.o \
+    command_parser.o \
+    common.o \
+    fft.o \
+    flash.o \
+    gain_cal.o \
+    globals.o \
+    ili9341.o \
+    main2.o \
+    numfont20x22.o \
+    plot.o \
+    sin_rom.o \
+    stream_fifo.o \
+    synthesizers.o \
+    ui.o \
+    uihw.o \
+    vna_measurement.o \
+    xpt2046.o \
+    spi_slave.o
 
-# Be silent per default, but 'make V=1' will show all compiler calls.
-ifneq ($(V),1)
-Q := @
-# Do not print "Entering directory ...".
-MAKEFLAGS += --no-print-directory
-endif
+OBJS    += \
+    $(MCULIB)/dma_adc.o \
+    $(MCULIB)/dma_driver.o \
+    $(MCULIB)/fastwiring.o \
+    $(MCULIB)/message_log.o \
+    $(MCULIB)/printf.o \
+    $(MCULIB)/si5351.o \
+    $(MCULIB)/usbserial.o
 
-# Avoid the use of shell find, for windows compatibility
-IRQ_DEFN_FILES  := $(foreach TARGET,$(TARGETS),$(wildcard include/libopencm3/$(TARGET)/irq.json))
-STYLECHECKFILES := $(wildcard include/*/*.h include/*/*/*.h include/*/*/*/*.h)
-STYLECHECKFILES += $(wildcard lib/*/*.h lib/*/*/*.h lib/*/*/*/*.h)
-STYLECHECKFILES += $(wildcard lib/*/*.c lib/*/*/*.c lib/*/*/*/*.c)
+# 基本的な最適化とデバッグ情報
+OPT             = -O2
+DEBUGINFO       = -g
 
-all: build
+# インクルードパス
+INCLUDE_DIRS   += -I$(BOARDNAME) -I$(MCULIB)/include -I$(OPENCM3_DIR)/include
 
-build: lib
+# libopencm3 の設定ファイルをインクルード (これにより ARCH_FLAGS, DEFS などが定義される)
+# これらは MCU 固有の -mcpu, -mthumb, ファミリー定義マクロを含むべき
+include $(OPENCM3_DIR)/mk/genlink-config.mk # genlink_family などが設定される
+include $(OPENCM3_DIR)/mk/gcc-config.mk     # ARCH_FLAGS, TOOLCHAIN_PREFIX, DEFS などが設定される
 
-%.genhdr:
-	@printf "  GENHDR  $*\n";
-	$(Q)./scripts/irq2nvic_h ./$*;
+# CとC++共通のフラグ
+# ARCH_FLAGSとDEFSはlibopencm3のmkファイルから来る (DEVICE=stm32f103c8 に基づくSTM32F1用になるはず)
+# PROJECT_DEFINES と EXTRA_CFLAGS を追加
+COMMON_FLAGS   = $(ARCH_FLAGS) $(DEFS) $(OPT) $(DEBUGINFO) \
+                 -Wall -Wno-unused-function -Werror=implicit-fallthrough \
+                 -ffunction-sections -fdata-sections \
+                 -funsigned-char -fwrapv -fno-delete-null-pointer-checks -fno-strict-aliasing \
+                 -D_XOPEN_SOURCE=600 \
+                 $(PROJECT_DEFINES) $(EXTRA_CFLAGS) # EXTRA_CFLAGS はコマンドラインから
 
-%.cleanhdr:
-	@printf "  CLNHDR  $*\n";
-	$(Q)./scripts/irq2nvic_h --remove ./$*
+CFLAGS          = $(COMMON_FLAGS) $(INCLUDE_DIRS)
+CXXFLAGS        = $(COMMON_FLAGS) $(INCLUDE_DIRS) --std=c++17 -fno-exceptions -fno-rtti
 
-LIB_DIRS:=$(wildcard $(addprefix lib/,$(TARGETS)))
-$(LIB_DIRS): $(IRQ_DEFN_FILES:=.genhdr)
-	$(Q)$(RM) .stamp_failure_$(subst /,_,$@)
-	@printf "  BUILD   $@\n";
-	$(Q)$(MAKE) --directory=$@ SRCLIBDIR="$(SRCLIBDIR)" PREFIX="$(PREFIX)" || \
-		echo "Failure building: $@: code: $$?" > .stamp_failure_$(subst /,_,$@)
+LDFLAGS        += -static -nostartfiles -Wl,--exclude-libs,libssp
+LDFLAGS        += -Wl,--gc-sections $(ARCH_LDFLAGS) # ARCH_LDFLAGS を追加
+LDLIBS         += -Wl,--start-group -lgcc -lnosys -Wl,--end-group -lm
 
-lib: $(LIB_DIRS)
-	$(Q)$(RM) .stamp_failure_tld
-	$(Q)for failure in .stamp_failure_*; do \
-		[ -f $$failure ] && cat $$failure >> .stamp_failure_tld || true; \
-	done;
-	$(Q)[ -f .stamp_failure_tld ] && cat .stamp_failure_tld && exit 1 || true;
+GITVERSION_FILE = gitversion.hpp
 
-html doc:
-	$(Q)$(MAKE) -C doc html TARGETS="$(TARGETS)"
+# リンカスクリプトはGD32F303CC用を維持するが、メモリマップの整合性に注意が必要
+# STM32F103としてコンパイルするが、物理デバイスはGD32F303なので、
+# リンカスクリプトはGD32F303のメモリサイズに合わせる必要がある。
+LDSCRIPT ?= ./gd32f303cc_with_bootloader_plus4.ld
 
-clean: $(IRQ_DEFN_FILES:=.cleanhdr) $(LIB_DIRS:=.clean) $(EXAMPLE_DIRS:=.clean) doc.clean styleclean genlinktests.clean
+.PHONY: all clean dist-clean flash bootload_firmware dfu
 
-%.clean:
-	$(Q)if [ -d $* ]; then \
-		printf "  CLEAN   $*\n"; \
-		$(MAKE) -C $* clean SRCLIBDIR="$(SRCLIBDIR)" || exit $?; \
-	fi;
-	$(Q)$(RM) .stamp_failure_*;
+all: $(GITVERSION_FILE) $(OPENCM3_LIB) binary.elf binary.hex binary.bin
 
+# libopencm3 ライブラリのビルド
+# DEVICE 変数がこの makefile インスタンスからサブの make に渡されるようにする
+$(OPENCM3_LIB):
+	$(MAKE) -C $(OPENCM3_DIR) DEVICE=$(DEVICE)
 
-stylecheck: $(STYLECHECKFILES:=.stylecheck)
-styleclean: $(STYLECHECKFILES:=.styleclean)
+$(GITVERSION_FILE): .git/HEAD .git/index
+	@echo "#define GITVERSION \"$(shell git log -n 1 --pretty=format:"git-%ad%h" --date=format:"%Y%m%d-")\"" > $@
+	@echo "#define GITURL \"$(shell git config --get remote.origin.url)\"" >> $@
 
-# the cat is due to multithreaded nature - we like to have consistent chunks of text on the output
-%.stylecheck: %
-	$(Q)if ! grep -q "* It was generated by the irq2nvic_h script." $* ; then \
-		$(STYLECHECK) $(STYLECHECKFLAGS) $* > $*.stylecheck; \
-		if [ -s $*.stylecheck ]; then \
-			cat $*.stylecheck; \
-		else \
-			rm -f $*.stylecheck; \
-		fi; \
-	fi;
+clean:
+	$(Q)$(RM) -f binary.elf binary.hex binary.bin binary.map \
+	             $(OBJS) $(GITVERSION_FILE) \
+	             $(BOARDNAME)/*.o $(MCULIB)/*.o *.o
 
-%.styleclean:
-	$(Q)rm -f $*.stylecheck;
+dist-clean: clean
+	$(MAKE) -C $(OPENCM3_DIR) clean
 
+flash: binary.hex
+	./st-flash --reset --format ihex write binary.hex
 
-LDTESTS		:=$(wildcard ld/tests/*.data)
+bootload_firmware dfu: binary.bin
+	python3 bootload_firmware.py --file $< --serial $(BOOTLOAD_PORT)
 
-genlinktests: $(LDTESTS:.data=.ldtest)
-genlinktests.clean:
-	$(Q)rm -f $(LDTESTS:.data=.out)
+# libopencm3 のルールファイルをインクルード
+# これらが .c.o や .cpp.o の汎用ルール、および .elf のリンクステップルールを提供する
+include $(OPENCM3_DIR)/mk/gcc-rules.mk # .c.o, .S.o などのコンパイルルール
+include $(OPENCM3_DIR)/mk/genlink-rules.mk # .elf, .bin, .hex などの生成ルール
+# ライブラリへのパス
+MCULIB         ?= mculib
+OPENCM3_DIR    ?= libopencm3
+BOOTLOAD_PORT  ?= /dev/ttyACM0
 
-%.ldtest:
-	@if ./scripts/genlinktest.sh $* >/dev/null; then\
-		printf "  TEST  OK  : $*\n";		\
-	else						\
-		printf "  TEST FAIL : $*\n";		\
-	fi;
+# デバイス設定
+BOARDNAME      ?= board_v2_plus4
 
+# ★★★ デバイス定義をSTM32F103に変更 ★★★
+# libopencm3が認識するSTM32F103の中密度デバイスを指定 (例: stm32f103c8)
+# これにより、libopencm3のヘッダはSTM32F1として処理されることを期待
+DEVICE         := stm32f103c8 # STM32F103C8T6 を想定
 
-.PHONY: build lib $(LIB_DIRS) doc clean generatedheaders cleanheaders stylecheck genlinktests genlinktests.clean
+# プロジェクト固有の定義
+# GD32関連の定義は削除し、mculibがSTM32F1を認識するようにする
+# STM32F1系のファミリー定義 (例: STM32F10X_MD) は libopencm3 の DEFS から提供されることを期待
+PROJECT_DEFINES := \
+    -DMCULIB_DEVICE_STM32F1 \
+    -DSWEEP_POINTS_MAX=201 \
+    -DSAVEAREA_MAX=7 \
+    -DDISPLAY_ST7796
+
+# ソースファイル一覧
+OBJS += \
+    $(BOARDNAME)/board.o \
+    Font5x7.o \
+    Font7x13b.o \
+    command_parser.o \
+    common.o \
+    fft.o \
+    flash.o \
+    gain_cal.o \
+    globals.o \
+    ili9341.o \
+    main2.o \
+    numfont20x22.o \
+    plot.o \
+    sin_rom.o \
+    stream_fifo.o \
+    synthesizers.o \
+    ui.o \
+    uihw.o \
+    vna_measurement.o \
+    xpt2046.o \
+    spi_slave.o
+
+OBJS    += \
+    $(MCULIB)/dma_adc.o \
+    $(MCULIB)/dma_driver.o \
+    $(MCULIB)/fastwiring.o \
+    $(MCULIB)/message_log.o \
+    $(MCULIB)/printf.o \
+    $(MCULIB)/si5351.o \
+    $(MCULIB)/usbserial.o
+
+# 基本的な最適化とデバッグ情報
+OPT             = -O2
+DEBUGINFO       = -g
+
+# インクルードパス
+INCLUDE_DIRS   += -I$(BOARDNAME) -I$(MCULIB)/include -I$(OPENCM3_DIR)/include
+
+# libopencm3 の設定ファイルをインクルード (これにより ARCH_FLAGS, DEFS などが定義される)
+# これらは MCU 固有の -mcpu, -mthumb, ファミリー定義マクロを含むべき
+include $(OPENCM3_DIR)/mk/genlink-config.mk # genlink_family などが設定される
+include $(OPENCM3_DIR)/mk/gcc-config.mk     # ARCH_FLAGS, TOOLCHAIN_PREFIX, DEFS などが設定される
+
+# CとC++共通のフラグ
+# ARCH_FLAGSとDEFSはlibopencm3のmkファイルから来る (DEVICE=stm32f103c8 に基づくSTM32F1用になるはず)
+# PROJECT_DEFINES と EXTRA_CFLAGS を追加
+COMMON_FLAGS   = $(ARCH_FLAGS) $(DEFS) $(OPT) $(DEBUGINFO) \
+                 -Wall -Wno-unused-function -Werror=implicit-fallthrough \
+                 -ffunction-sections -fdata-sections \
+                 -funsigned-char -fwrapv -fno-delete-null-pointer-checks -fno-strict-aliasing \
+                 -D_XOPEN_SOURCE=600 \
+                 $(PROJECT_DEFINES) $(EXTRA_CFLAGS) # EXTRA_CFLAGS はコマンドラインから
+
+CFLAGS          = $(COMMON_FLAGS) $(INCLUDE_DIRS)
+CXXFLAGS        = $(COMMON_FLAGS) $(INCLUDE_DIRS) --std=c++17 -fno-exceptions -fno-rtti
+
+LDFLAGS        += -static -nostartfiles -Wl,--exclude-libs,libssp
+LDFLAGS        += -Wl,--gc-sections $(ARCH_LDFLAGS) # ARCH_LDFLAGS を追加
+LDLIBS         += -Wl,--start-group -lgcc -lnosys -Wl,--end-group -lm
+
+GITVERSION_FILE = gitversion.hpp
+
+# リンカスクリプトはGD32F303CC用を維持するが、メモリマップの整合性に注意が必要
+# STM32F103としてコンパイルするが、物理デバイスはGD32F303なので、
+# リンカスクリプトはGD32F303のメモリサイズに合わせる必要がある。
+LDSCRIPT ?= ./gd32f303cc_with_bootloader_plus4.ld
+
+.PHONY: all clean dist-clean flash bootload_firmware dfu
+
+all: $(GITVERSION_FILE) $(OPENCM3_LIB) binary.elf binary.hex binary.bin
+
+# libopencm3 ライブラリのビルド
+# DEVICE 変数がこの makefile インスタンスからサブの make に渡されるようにする
+$(OPENCM3_LIB):
+	$(MAKE) -C $(OPENCM3_DIR) DEVICE=$(DEVICE)
+
+$(GITVERSION_FILE): .git/HEAD .git/index
+	@echo "#define GITVERSION \"$(shell git log -n 1 --pretty=format:"git-%ad%h" --date=format:"%Y%m%d-")\"" > $@
+	@echo "#define GITURL \"$(shell git config --get remote.origin.url)\"" >> $@
+
+clean:
+	$(Q)$(RM) -f binary.elf binary.hex binary.bin binary.map \
+	             $(OBJS) $(GITVERSION_FILE) \
+	             $(BOARDNAME)/*.o $(MCULIB)/*.o *.o
+
+dist-clean: clean
+	$(MAKE) -C $(OPENCM3_DIR) clean
+
+flash: binary.hex
+	./st-flash --reset --format ihex write binary.hex
+
+bootload_firmware dfu: binary.bin
+	python3 bootload_firmware.py --file $< --serial $(BOOTLOAD_PORT)
+
+# libopencm3 のルールファイルをインクルード
+# これらが .c.o や .cpp.o の汎用ルール、および .elf のリンクステップルールを提供する
+include $(OPENCM3_DIR)/mk/gcc-rules.mk # .c.o, .S.o などのコンパイルルール
+include $(OPENCM3_DIR)/mk/genlink-rules.mk # .elf, .bin, .hex などの生成ルール

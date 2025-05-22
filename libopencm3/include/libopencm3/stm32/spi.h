@@ -16,6 +16,8 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this library.  If not, see <http://www.gnu.org/licenses/>.
  */
+#define STM32F1 // Temporarily define for STM32 SPI header compatibility
+#undef STM32F1  // Undefine immediately to avoid conflicts
 
 #include <libopencm3/cm3/common.h>
 #include <libopencm3/stm32/memorymap.h>

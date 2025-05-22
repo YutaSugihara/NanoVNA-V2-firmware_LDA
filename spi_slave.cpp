@@ -1,178 +1,221 @@
 #include "spi_slave.hpp"
-#include "board.hpp" // board.hpp からピン定義を読み込む (例: PIN_SPI1_SCKなど)
-                     // board_v2_plus4/board.hpp を想定
-#include <libopencm3/stm32/rcc.h> // RCC制御関数 (クロック有効化など)
+// board.hpp は spi_slave.hpp より後にインクルードされるか、
+// spi_slave.hpp が依存する定義 (Padなど) を含まないようにする。
+// ここでは board.hpp は不要と仮定し、必要なものは spi_slave.hpp 経由で解決する。
+// #include "board_v2_plus4/board.hpp"
 
-// SPISlave* g_spi_slave_ptr = nullptr; // main2.cpp で実体を定義し、ここに割り当てる場合
+// libopencm3 STM32F1 specific headers (spi_slave.hppでインクルード済み)
+// <libopencm3/stm32/rcc.h>  // rcc_periph_clock_enable(RCC_SPI1) のため
+// <libopencm3/stm32/gpio.h> // gpio_set_mode のため
+// <libopencm3/stm32/spi.h>  // spi_reset, spi_init_slave のため
+// <libopencm3/cm3/nvic.h>   // nvic_enable_irq のため
 
-SPISlave::SPISlave() : tx_active(false) {
-    // g_spi_slave_ptr = this; // ISRからこのインスタンスにアクセスできるようにする
-}
+#include <cstring> // For memcpy
 
-void SPISlave::gpio_init() {
-    // SPI1のクロックを有効化 (board.cppのboardInitでも行われるが念のため)
-    rcc_periph_clock_enable(RCC_SPI1);
-    rcc_periph_clock_enable(RCC_GPIOA); // PA4, PA5, PA6, PA7 を使用
+// グローバルバッファとフラグ (spi_slave.hppでextern宣言されているものの実体)
+VNADataPoint_t spiVnaDataBuffer[MAX_SWEEP_POINTS];
+volatile uint16_t spiVnaDataBufferCount = 0;
+volatile bool spiDataReadyFlag = false;
+volatile bool spiMeasurementInProgressFlag = false;
 
-    // SPI1ピン設定 (board_v2_plus4 向け)
-    // PA4 (SPI1_NSS): ハードウェアNSS入力 (マスターが制御)
-    //                 GD32では、スレーブモードでNSSハードウェア管理の場合、入力として設定
-    gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, PIN_SLAVE_SPI_NSS); // PIN_SLAVE_SPI_NSS は board.hppで定義想定 (PA4)
+static volatile uint8_t spi_rx_cmd_buffer[SPI_CMD_RX_BUFFER_SIZE];
+static volatile uint8_t spi_rx_cmd_buffer_idx = 0;
+static uint8_t spi_tx_chunk_buffer[SPI_DATA_TX_CHUNK_SIZE];
+static volatile uint16_t spi_tx_chunk_buffer_len = 0;
+static volatile uint16_t spi_tx_chunk_buffer_idx = 0;
+static uint16_t current_tx_data_point_index = 0;
 
-    // PA5 (SPI1_SCK): スレーブモードでは入力
-    gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, PIN_SLAVE_SPI_SCK); // PIN_SLAVE_SPI_SCK は board.hppで定義想定 (PA5)
-    gpio_set_af(GPIOA, GPIO_AF0, PIN_SLAVE_SPI_SCK); // GD32F303ではAF0
+void spi_slave_init(void) {
+    // SPI1 および GPIOA のクロックは board.cpp の rcc_config で有効化されている前提
+    // rcc_periph_clock_enable(RCC_SPI1);
+    // rcc_periph_clock_enable(RCC_GPIOA);
 
-    // PA6 (SPI1_MISO): スレーブモードではAF出力
-    gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, PIN_SLAVE_SPI_MISO); // PIN_SLAVE_SPI_MISO は board.hppで定義想定 (PA6)
-    gpio_set_output_options(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, PIN_SLAVE_SPI_MISO);
-    gpio_set_af(GPIOA, GPIO_AF0, PIN_SLAVE_SPI_MISO);
+    // SPI1ピン設定 (STM32F103の場合)
+    // PA4 (SPI1_NSS)  : Input floating (ハードウェアNSS)
+    // PA5 (SPI1_SCK)  : Input floating
+    // PA6 (SPI1_MISO) : Alternate function output push-pull
+    // PA7 (SPI1_MOSI) : Input floating
+    gpio_set_mode(GPIOA, GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, GPIO4 | GPIO5 | GPIO7);
+    gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, GPIO6);
 
-    // PA7 (SPI1_MOSI): スレーブモードでは入力
-    gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, PIN_SLAVE_SPI_MOSI); // PIN_SLAVE_SPI_MOSI は board.hppで定義想定 (PA7)
-    gpio_set_af(GPIOA, GPIO_AF0, PIN_SLAVE_SPI_MOSI);
-}
+    spi_reset(SPI1);
 
-void SPISlave::spi_peripheral_init() {
-    spi_reset(SPI1); // SPI1をリセット
+    // SPI1をスレーブモードで初期化 (STM32F1 API)
+    spi_init_slave(SPI1,
+                   SPI_CR1_BAUDRATE_FPCLK_DIV_256, // スレーブでは無視される
+                   SPI_CR1_CPOL_CLK_TO_0_WHEN_IDLE,  // CPOL=0
+                   SPI_CR1_CPHA_CLK_TRANSITION_2,  // CPHA=1 (SPIモード1)
+                   SPI_CR1_DFF_8BIT,
+                   SPI_CR1_MSBFIRST);
 
-    // SPI1 をスレーブモードで初期化
-    spi_set_slave_mode(SPI1);
+    spi_disable_software_slave_management(SPI1); // ハードウェアNSSを使用
+    // SSOEビットはスレーブモードでは0に保つ (デフォルトのはず)
 
-    // SPIモード1 (CPOL=0, CPHA=1)
-    spi_set_clock_polarity_0(SPI1); // CPOL = 0
-    spi_set_clock_phase_1(SPI1);    // CPHA = 1 (立ち上がりエッジでデータキャプチャ)
+    spi_enable_rx_buffer_not_empty_interrupt(SPI1);
+    // TXE割り込みは送信データがあるときに有効化する
 
-    spi_set_data_size(SPI1, SPI_CR2_DS_8BIT); // 8ビットデータフォーマット
-    spi_set_first_bit_msb_first(SPI1);      // MSBファースト
-
-    // NSSピン管理: ハードウェアNSSを使用
-    // スレーブモードでハードウェアNSSを使用する場合、SSMビットをクリアし、SSOEビットをクリア
-    // (SSOE=0: NSSピンは入力として動作し、マスターによって駆動される)
-    spi_disable_software_slave_management(SPI1);
-    spi_disable_ss_output(SPI1); // NSSピンを入力として動作させる (マスターが制御)
-                                 // GD32のドキュメントでは、スレーブモードでNSSをハードウェア入力として使用する場合、
-                                 // SSM=0, SSI=0 (spi_disable_software_slave_managementがSSIを内部的に制御)
-                                 // NSSPビットはNSSパルスモード用なのでここでは関係なし
-
-    // Baudrate prescaler: スレーブモードではマスターのクロックに従うため通常不要だが、
-    // libopencm3の `spi_init_slave` は設定を要求する場合がある。
-    // `spi_init_slave` は内部で `spi_set_baudrate_prescaler` を呼ぶため、
-    // ここでは直接 `spi_init_slave` を使わず、個別の設定関数を使用。
-    // もし `spi_init_slave` を使うなら、ダミーのボーレートを設定する。
-    // spi_set_baudrate_prescaler(SPI1, SPI_CR1_BR_FPCLK_DIV_256); // スレーブでは無視されるはず
-
-    spi_enable_rx_buffer_not_empty_interrupt(SPI1); // 受信割り込み有効化
-    // spi_enable_tx_buffer_empty_interrupt(SPI1);  // 送信割り込みは必要に応じて有効化 (handle_interrupt内で動的に)
-
-    spi_enable(SPI1); // SPI1を有効化
-}
-
-void SPISlave::nvic_init() {
-    // SPI1割り込みを有効化
     nvic_enable_irq(NVIC_SPI1_IRQ);
-    nvic_set_priority(NVIC_SPI1_IRQ, 1); // 割り込み優先度を設定 (必要に応じて調整)
+    nvic_set_priority(NVIC_SPI1_IRQ, 1); // 割り込み優先度を設定
+
+    spi_enable(SPI1);
+
+    // フラグとバッファの初期化
+    spiDataReadyFlag = false;
+    spiMeasurementInProgressFlag = false;
+    spiVnaDataBufferCount = 0;
+    spi_rx_cmd_buffer_idx = 0;
+    spi_tx_chunk_buffer_len = 0;
+    spi_tx_chunk_buffer_idx = 0;
+    current_tx_data_point_index = 0;
 }
 
-void SPISlave::init() {
-    gpio_init();
-    spi_peripheral_init();
-    nvic_init();
-    tx_active = false;
-}
+// SPI1 割り込みハンドラ (名前はスタートアップファイルに合わせる)
+extern "C" void spi1_isr(void) {
+    // 受信バッファ非空フラグを確認
+    if (spi_get_flag(SPI1, SPI_SR_RXNE)) {
+        uint8_t received_byte = spi_read(SPI1); // 受信データを読み取り (RXNEフラグクリア)
+        if (spi_rx_cmd_buffer_idx < SPI_CMD_RX_BUFFER_SIZE) {
+            spi_rx_cmd_buffer[spi_rx_cmd_buffer_idx++] = received_byte;
+        }
+        // コマンド処理はメインループで行う (spi_slave_poll)
+    }
 
-void SPISlave::handle_interrupt() {
-    // 受信バッファ非エンプティ (RXNE) フラグ確認
-    if (spi_is_rx_nonempty(SPI1)) {
-        uint8_t received_byte = spi_read(SPI1);
-        if (!rx_fifo.isFull()) {
-            rx_fifo.put(received_byte);
+    // 送信バッファ空フラグを確認
+    if (spi_get_flag(SPI1, SPI_SR_TXE)) {
+        if (spi_tx_chunk_buffer_idx < spi_tx_chunk_buffer_len) {
+            spi_write(SPI1, spi_tx_chunk_buffer[spi_tx_chunk_buffer_idx++]);
         } else {
-            // RX FIFOオーバーフロー処理 (例: エラーフラグを立てる、ログ記録など)
+            // 現在のチャンクの送信が完了
+            spi_write(SPI1, 0xFF); // ダミーバイトを送信しておく
+            spi_disable_tx_buffer_empty_interrupt(SPI1); // これ以上送信するデータがなければTXE割り込みを無効化
         }
     }
 
-    // 送信バッファエンプティ (TXE) フラグ確認
-    if (spi_is_tx_empty(SPI1)) {
-        if (!tx_fifo.isEmpty()) {
-            spi_write(SPI1, tx_fifo.get());
-            tx_active = true;
-            spi_enable_tx_buffer_empty_interrupt(SPI1); // 次のバイト送信のためにTXE割り込みを維持
-        } else {
-            // 送信すべきデータがない場合
-            spi_write(SPI1, 0xFF); // ダミーバイトを送信 (マスターがクロックを供給し続ける場合)
-            tx_active = false;
-            spi_disable_tx_buffer_empty_interrupt(SPI1); // 送信データがないのでTXE割り込みを無効化
-        }
-    }
-
-    // エラーフラグ確認 (例: オーバーランエラー)
-    if (spi_get_error_flag(SPI1, SPI_SR_OVR)) {
-        // SPI_SR_OVRビットは読み取り、その後SPI_DRとSPI_SRを読むことでクリアされる
-        (void)SPI_DR(SPI1); // データレジスタを読む
-        (void)SPI_SR(SPI1); // ステータスレジスタを読む
-        // オーバーランエラー処理
-    }
-    // 他のエラーフラグ (MODF, CRCERRなど) も必要に応じて確認
-}
-
-bool SPISlave::read_command(uint8_t& cmd) {
-    if (!rx_fifo.isEmpty()) {
-        cmd = rx_fifo.get();
-        return true;
-    }
-    return false;
-}
-
-void SPISlave::prepare_tx_byte(uint8_t data) {
-    // TODO: 割り込み保護が必要な場合がある
-    // __disable_irq();
-    if (!tx_fifo.isFull()) {
-        tx_fifo.put(data);
-    }
-    // __enable_irq();
-
-    // 送信がアクティブでなく、TX FIFOにデータがある場合、送信開始を試みる
-    // (マスターからのクロック供給とNSSデアサート->アサートが必要)
-    if (!tx_active && !tx_fifo.isEmpty()) {
-         // 最初のバイトを送信するためにTXE割り込みを有効にする
-         // マスターがクロックを提供すると、TXE割り込みが発生して送信が開始される
-        spi_enable_tx_buffer_empty_interrupt(SPI1);
+    // オーバーランエラーフラグを確認
+    if (spi_get_flag(SPI1, SPI_SR_OVR)) {
+        (void)SPI_DR(SPI1); // DRを読む (OVRフラグクリアのためにはDRとSRの読み出しが必要な場合がある)
+        (void)SPI_SR(SPI1); // SRを読む
+        // オーバーランエラー処理 (例: エラーフラグを立てる、状態をリセットするなど)
     }
 }
 
-void SPISlave::prepare_tx_data(const uint8_t* data, uint16_t len) {
-    // TODO: 割り込み保護が必要な場合がある
-    // __disable_irq();
-    for (uint16_t i = 0; i < len; ++i) {
-        if (!tx_fifo.isFull()) {
-            tx_fifo.put(data[i]);
-        } else {
-            // TX FIFOオーバーフロー処理
+// SPIコマンド処理 (メインループからポーリングで呼び出される)
+void spi_process_command(uint8_t cmd) {
+    switch (cmd) {
+        case CMD_TRIGGER_SWEEP:
+            if (!spiMeasurementInProgressFlag) {
+                spi_slave_notify_measurement_start(); // 測定開始を通知 (フラグ設定など)
+            }
             break;
-        }
-    }
-    // __enable_irq();
 
-    if (!tx_active && !tx_fifo.isEmpty()) {
-        spi_enable_tx_buffer_empty_interrupt(SPI1);
+        case CMD_REQUEST_DATA:
+            spi_prepare_data_for_tx(); // 送信データ準備
+            if (spi_tx_chunk_buffer_len > 0) { // 送信するデータがある場合
+                 spi_enable_tx_buffer_empty_interrupt(SPI1); // TXE割り込みを有効にして送信開始
+            }
+            break;
+
+        case CMD_REQUEST_STATUS:
+            {
+                uint8_t status = spi_get_status();
+                // ステータスバイトを送信準備
+                spi_tx_chunk_buffer[0] = status;
+                spi_tx_chunk_buffer_len = 1;
+                spi_tx_chunk_buffer_idx = 0;
+                spi_enable_tx_buffer_empty_interrupt(SPI1); // TXE割り込みを有効にして送信開始
+            }
+            break;
+
+        default:
+            // 未知のコマンド
+            break;
     }
 }
 
-// SPI1の割り込みハンドラ (ベクターテーブルに登録される関数)
-// この関数はグローバルスコープに配置するか、クラスの静的メンバとして宣言し、
-// ポインタ経由でクラスインスタンスのメソッドを呼び出す必要がある。
-// 今回は main2.cpp に SPISlave のインスタンスを作成し、
-// そのインスタンスの handle_interrupt() を呼び出すようにする。
-// extern SPISlave spi_slave_instance; // main2.cpp で定義されるインスタンス
-// void spi1_isr(void) {
-//     spi_slave_instance.handle_interrupt();
-// }
-// または、g_spi_slave_ptr を使用する
-// void spi1_isr(void) {
-//    if (g_spi_slave_ptr) {
-//        g_spi_slave_ptr->handle_interrupt();
-//    }
-// }
-// → main2.cpp で SPISlave のグローバルインスタンスを作成し、
-//    そのインスタンスのメソッドを直接呼び出すように ISR を main2.cpp に配置する方が良い。
+// SPI送信用にデータを準備する
+void spi_prepare_data_for_tx(void) {
+    if (spiDataReadyFlag && (current_tx_data_point_index < spiVnaDataBufferCount)) {
+        uint16_t points_in_chunk = SPI_DATA_TX_CHUNK_SIZE / sizeof(VNADataPoint_t);
+        uint16_t remaining_points = spiVnaDataBufferCount - current_tx_data_point_index;
+        uint16_t points_to_send_this_chunk = (remaining_points < points_in_chunk) ? remaining_points : points_in_chunk;
+
+        if (points_to_send_this_chunk > 0) {
+            memcpy(spi_tx_chunk_buffer,
+                   &spiVnaDataBuffer[current_tx_data_point_index],
+                   points_to_send_this_chunk * sizeof(VNADataPoint_t));
+            spi_tx_chunk_buffer_len = points_to_send_this_chunk * sizeof(VNADataPoint_t);
+            spi_tx_chunk_buffer_idx = 0; // 送信インデックスをリセット
+            current_tx_data_point_index += points_to_send_this_chunk;
+        } else {
+            spi_tx_chunk_buffer_len = 0; // 送信するデータなし
+        }
+    } else {
+        spi_tx_chunk_buffer_len = 0; // データ準備未完了または全データ送信済み
+        if (spiDataReadyFlag && current_tx_data_point_index >= spiVnaDataBufferCount) {
+            // 全データ送信完了後の処理 (例: 次のデータ要求に備えてインデックスをリセット)
+            // current_tx_data_point_index = 0;
+            // spiDataReadyFlag = false; // 必要に応じて
+        }
+    }
+}
+
+// VNAの現在のステータスを取得
+uint8_t spi_get_status(void) {
+    if (spiMeasurementInProgressFlag) {
+        return STATUS_MEASURING;
+    }
+    if (spiDataReadyFlag) {
+        // 送信すべきデータが残っているか確認
+        if (current_tx_data_point_index < spiVnaDataBufferCount) {
+            return STATUS_DATA_READY; // データ準備完了、送信可能
+        } else {
+            return STATUS_IDLE; // 全データ送信完了、アイドル状態に戻る
+        }
+    }
+    return STATUS_IDLE;
+}
+
+// メインループから呼び出されるSPIポーリング関数
+void spi_slave_poll(void) {
+    if (spi_rx_cmd_buffer_idx > 0) {
+        // 割り込み禁止でコマンドバッファを安全に処理
+        __disable_irq();
+        uint8_t cmd_to_process = spi_rx_cmd_buffer[0];
+        // 簡単な単一バイトコマンドの場合、バッファをクリア
+        // リングバッファなどを使用する場合は、より高度な処理が必要
+        spi_rx_cmd_buffer_idx = 0;
+        __enable_irq();
+
+        spi_process_command(cmd_to_process);
+    }
+}
+
+// 測定開始を通知する関数
+void spi_slave_notify_measurement_start(void) {
+    spiMeasurementInProgressFlag = true;
+    spiDataReadyFlag = false;
+    spiVnaDataBufferCount = 0;
+    current_tx_data_point_index = 0; // 新しい測定のために送信インデックスをリセット
+    // 必要であれば、送信バッファもクリア
+    spi_tx_chunk_buffer_len = 0;
+    spi_tx_chunk_buffer_idx = 0;
+}
+
+// 測定完了を通知する関数
+void spi_slave_notify_measurement_complete(void) {
+    spiMeasurementInProgressFlag = false;
+    spiDataReadyFlag = true;
+    // current_tx_data_point_index は spi_prepare_data_for_tx で管理されるのでここではリセットしない
+}
+
+// 測定データポイントをバッファリングする関数
+void spi_slave_buffer_data_point(uint32_t freq_hz, complexf s11, complexf s21) {
+    if (spiVnaDataBufferCount < MAX_SWEEP_POINTS) {
+        spiVnaDataBuffer[spiVnaDataBufferCount].frequency = (float)freq_hz;
+        spiVnaDataBuffer[spiVnaDataBufferCount].s11_real = s11.real;
+        spiVnaDataBuffer[spiVnaDataBufferCount].s11_imag = s11.imag;
+        spiVnaDataBuffer[spiVnaDataBufferCount].s21_real = s21.real;
+        spiVnaDataBuffer[spiVnaDataBufferCount].s21_imag = s21.imag;
+        spiVnaDataBufferCount++;
+    }
+}
